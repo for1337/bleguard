@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "leo.bleguard",
+  "name": "BLE Auto-Lock",
+  "version": "1.0.0",
+  "author": "Leonardo (for1337)",
+  "description": "Auto-locks the screen when the configured phone is out of BLE range and the user is idle.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "BLE Auto-Lock",
+    "description": "Locks the laptop when your phone is out of BLE range and you are idle.",
+    "category": "Security",
+    "allowMultiple": false,
+    "defaults": {
+      "defaultSection": "right"
+    }
+  }
+}
