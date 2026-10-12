@@ -34,6 +34,19 @@ readonly property string state: svc ? svc.state : "DISARMED"
   readonly property string targetMac: svc ? svc.targetMac : ""
   readonly property int lastRssi: svc && svc.lastRssi !== undefined ? Number(svc.lastRssi) : 0
   readonly property var lastRssiAt: svc && svc.lastRssiAt !== undefined ? Number(svc.lastRssiAt) : 0
+  // Stamps only when the RSSI VALUE actually changes (not on every poll).
+  // Used by the popup to flag BlueZ's cached readings — paired+bonded+
+  // trusted ColorOS devices stop exposing fresh RSSI from advertisements,
+  // so a long-elapsed change timestamp is the fingerprint of that quirk.
+  readonly property var lastRssiValueChangeAt: svc && svc.lastRssiValueChangeAt !== undefined ? Number(svc.lastRssiValueChangeAt) : 0
+  // Show a "cached" hint when the last real RSSI change is older than this.
+  // Long enough that a stationary phone (genuine -39 sustained) doesn't
+  // trigger; short enough that a 1m+ range change shows up within seconds
+  // when BlueZ is actually updating.
+  readonly property int rssiCachedAfterMs: 60000
+  readonly property bool rssiAppearsStale: lastRssi !== 0
+    && lastRssiValueChangeAt !== 0
+    && (Date.now() - lastRssiValueChangeAt) > rssiCachedAfterMs
   readonly property real distance: svc && svc.distanceMeters !== undefined ? Number(svc.distanceMeters) : 0
   readonly property int threshold: svc ? svc.rssiThreshold : -85
   readonly property bool idle: svc ? svc.idle : false
@@ -310,12 +323,17 @@ readonly property string state: svc ? svc.state : "DISARMED"
               }
             }
 
-            // Footer note when RSSI is stale or never observed (e.g. BR/EDR
-            // phone that doesn't expose one, or phone currently out of range).
+            // Footer note when RSSI is stale or never observed. Two flavors: the
+            // RSSI value stopped updating at all (BlueZ caches it for
+            // paired+bonded+trusted ColorOS devices — see omarchy-ble-
+            // paired-stops-rssi memory), or it was never observed (older
+            // BR/EDR-only phones that don't BLE-advertise). Either way
+            // the plugin is still using BLE advertising as ground truth
+            // for proximity.
             Text {
               visible: !root.rssiFresh && root.armed && root.targetMac !== ""
               text: root.lastRssi === 0
-                ? "RSSI not exposed by BlueZ for this device (BR/EDR phones usually don't advertise over BLE)."
+                ? "RSSI not exposed by BlueZ for this device. Most often: paired+trusted phones (ColorOS) hide RSSI after bonding — BLE advertising still works, plugin still detects presence."
                 : "Phone out of BLE range — no live RSSI."
               color: root.dim
               font.family: root.fontFamily
@@ -323,6 +341,21 @@ readonly property string state: svc ? svc.state : "DISARMED"
               wrapMode: Text.WordWrap
               Layout.fillWidth: true
               Layout.topMargin: Style.space(-4)
+            }
+
+            // Footer hint when the RSSI value once moved but stopped.
+            // Different from the "never observed" case above: the chart
+            // is showing a real value but it has not updated in a while,
+            // which is the typical "BlueZ cached" fingerprint.
+            Text {
+              visible: root.rssiAppearsStale && root.armed
+              text: "RSSI hasn't updated in " + Math.floor((Date.now() - root.lastRssiValueChangeAt) / 60000) + " min — BlueZ appears to cache RSSI for paired devices. Plugin still uses BLE advertising for proximity."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+              Layout.fillWidth: true
+              Layout.topMargin: Style.space(4)
             }
 
             // ---- Distance box ----
