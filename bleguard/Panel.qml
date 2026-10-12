@@ -451,6 +451,27 @@ readonly property string state: svc ? svc.state : "DISARMED"
                 property bool armed: chartFrame.armed
                 property bool targetSet: chartFrame.targetSet
 
+                // Quickshell panels sometimes lose the property-
+                // change notification when the source is reached
+                // through serviceFor() → chartFrame.thr →
+                // chart.thr (multiple QObject hops across IPC).
+                // Add an explicit Connections so the canvas
+                // always repaints when the user's threshold
+                // changes — the binding still works, this is a
+                // safety net so the dashed thr line moves even
+                // if the chain fails.
+                Connections {
+                  target: root
+                  function onThresholdChanged() {
+                    chart.thr = root.threshold
+                    chart.requestPaint()
+                  }
+                  function onRssiHistoryChanged() {
+                    chart.history = root.rssiHistory
+                    chart.requestPaint()
+                  }
+                }
+
                 onHistoryChanged: chart.requestPaint()
                 onThrChanged: chart.requestPaint()
                 onRssiMinChanged: chart.requestPaint()
