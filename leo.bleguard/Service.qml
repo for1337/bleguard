@@ -19,6 +19,9 @@ Item {
   readonly property int graceSeconds: 10
   readonly property int idleThresholdSeconds: 30
   readonly property int rssiStaleMs: 6000
+  // When RSSI hasn't updated for this long, we assume BlueZ stopped
+  // exposing it (ColorOS quirk) and fall back to connection-only proximity.
+  readonly property int rssiStaleWindowMs: 30000
   readonly property int rssiPollMs: 2000
   readonly property int idlePollMs: 1000
   readonly property int lockCheckMs: 1000
@@ -73,6 +76,10 @@ Item {
   // Only real busctl readings — never the synthetic `lastRssi = 0` we set
   // when the phone drops, otherwise the chart would lie about presence.
   property var rssiHistory: []
+  // True once BlueZ has returned at least one real RSSI for this device.
+  // While false, phoneLost() falls back to connection-only proximity
+  // (relevant for paired+trusted devices where BlueZ never exposes RSSI).
+  property bool rssiEverObserved: false
   readonly property real distanceMeters: {
     if (!lastRssi || lastRssi === 0) return 0
     return Math.pow(10, (service.txPowerDbm - lastRssi) / (10 * service.pathLoss))
@@ -82,7 +89,20 @@ Item {
     var dev = service.findTargetDevice()
     var connected = dev ? dev.connected : false
     if (!connected) return true
-    if (lastRssiAt && (Date.now() - lastRssiAt) > service.rssiStaleMs) return true
+
+    // If the last RSSI was very long ago (or never observed), BlueZ has
+    // likely stopped exposing it (omarchy-ble-paired-stops-rssi quirk on
+    // ColorOS). Fall back to "connection-only proximity" — the phone is
+    // "in range" iff it's connected. This keeps auto-unlock working when
+    // the user returns with the phone.
+    var rssiFresh = service.rssiEverObserved
+      && lastRssiAt
+      && (Date.now() - lastRssiAt) <= service.rssiStaleWindowMs
+    if (!rssiFresh) {
+      // Connected, but no usable RSSI. Trust the ACL only.
+      return false
+    }
+
     if (lastRssi !== 0 && lastRssi < service.rssiThreshold) return true
     return false
   }
@@ -195,6 +215,7 @@ Item {
           var now = Date.now()
           service.lastRssi = n
           service.lastRssiAt = now
+          service.rssiEverObserved = true
           service.pushHistory(n, now)
           service.evaluateProximity()
         }
@@ -204,12 +225,14 @@ Item {
       if (exitCode !== 0) {
         var msg = String(rssiProc.stdout ? rssiProc.stdout.text : "")
         if (msg.indexOf("No such property") >= 0 && rssiPollTimer.running) {
-          // Phone does not advertise over BLE. Stop polling and rely on
-          // connection state only. We re-enable polling whenever the
-          // user re-arms the plugin (see setArmed).
-          rssiPollTimer.stop()
+          // Phone does not advertise over BLE (ColorOS quirk, see
+          // omarchy-ble-paired-stops-rssi memory). Don't tear down the
+          // polling timer — keep evaluateProximity() running so we still
+          // check the connection state. RSSI stays 0; the rssiStaleMs
+          // timer inside phoneLost() will declare the phone "lost" after
+          // 6s if the property never reappears.
           console.log("leo.bleguard: RSSI not exposed by BlueZ for " +
-                      service.targetMac + " — using connection state only")
+                      service.targetMac + " — connection-only proximity")
         }
       }
     }
@@ -304,8 +327,13 @@ Item {
         if (v === "true") {
           if (service.state !== "LOCKED") {
             service.state = "LOCKED"
-            // Manual external lock — not from this plugin's triggerLock().
-            service.autoLockSource = false
+            // Only treat as a manual external lock if our triggerLock()
+            // didn't already set autoLockSource=true. Otherwise preserve it
+            // so auto-unlock still fires for plugin-triggered locks.
+            if (!service.autoLockSource) {
+              // Coming from omarchy-system-lock keybind or similar — keep
+              // autoLockSource=false so we don't auto-unlock a manual lock.
+            }
           }
           // Keep polling — we need to detect the manual unlock so the
           // state machine returns to ARMED. Stopping here strands the
@@ -504,6 +532,10 @@ Item {
       if (persisted.targetMac) {
         rssiPollTimer.start()
         service.startRssiPoll()
+        // Grace window while first poll runs (or fails). Without this, if
+        // BlueZ never exposes RSSI for a paired device, phoneLost() can
+        // never trigger because both rssiAt and rssi stay at 0.
+        service.lastRssiAt = Date.now()
       }
       service.evaluateProximity()
     }
