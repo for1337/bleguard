@@ -20,7 +20,8 @@ Item {
   readonly property int idleThresholdSeconds: 30
   readonly property int rssiStaleMs: 6000
   // When RSSI hasn't updated for this long, we assume BlueZ stopped
-  // exposing it (ColorOS quirk) and fall back to connection-only proximity.
+  // exposing it (paired+bonded+trusted phones may hide RSSI) and fall
+  // back to connection-only proximity.
   readonly property int rssiStaleWindowMs: 30000
   readonly property int rssiPollMs: 2000
   readonly property int idlePollMs: 1000
@@ -73,20 +74,20 @@ Item {
   property var lastRssiAt: 0
   // Stamps Date.now() ONLY when the RSSI value actually changes between
   // busctl polls. Used by the popup to flag cached readings — BlueZ
-  // stops tracking RSSI for paired+bonded+trusted ColorOS devices, so
-  // a long-elapsed change timestamp is the fingerprint of that quirk
-  // (see omarchy-ble-paired-stops-rssi memory). Does NOT update when
-  // the value is the same as before: a stationary phone genuinely stays
-  // at one value, and we'd rather not flag a real "still here" as stale.
+  // stops tracking RSSI for paired+bonded+trusted devices, so a long-
+  // elapsed change timestamp is the fingerprint of that. Does NOT
+  // update when the value is the same as before: a stationary phone
+  // genuinely stays at one value, and we'd rather not flag a real "still
+  // here" as stale.
   property var lastRssiValueChangeAt: 0
 
   // "Phone is advertising" evidence. BlueZ populates AdvertisingFlags /
   // ManufacturerData when an advertisement is processed while Discovering=true,
-  // even if the BR/EDR ACL is asleep (ColorOS "fast sleep" pattern). We treat
-  // recent advertising presence as a strong "phone is here" signal — used
-  // ONLY by the auto-unlock path so the laptop can be re-armed when the user
-  // comes back with a sleeping-but-broadcasting phone. WARNING/AUTO-LOCK
-  // paths continue to use phoneLost() which treats disconnected=lost.
+  // even if the BR/EDR ACL is asleep (some phones drop ACL during sleep while
+  // still broadcasting BLE ads). We treat recent advertising presence as a
+  // strong "phone is here" signal — used by the auto-unlock path so the
+  // laptop can be re-armed when the user comes back with a sleeping-but-
+  // broadcasting phone. The warning path also uses it via phoneLost().
   property var lastAdvAt: 0
   property bool advertisingEverObserved: false
 
@@ -107,8 +108,9 @@ Item {
     var dev = service.findTargetDevice()
     var connected = dev ? dev.connected : false
 
-    // BR/EDR ACL up: trust the ACL when RSSI is stale (ColorOS quirk
-    // while connected). Apply threshold when RSSI is fresh.
+    // BR/EDR ACL up: trust the ACL when RSSI is stale (some phones hide
+    // RSSI while ACL is up once paired+bonded+trusted). Apply threshold
+    // when RSSI is fresh.
     if (connected) {
       var rssiFresh = service.rssiEverObserved
         && lastRssiAt
@@ -118,20 +120,18 @@ Item {
       return false
     }
 
-    // BR/EDR ACL down — ColorOS fast-sleep drops ACL while still
+    // BR/EDR ACL down — some phones drop ACL during sleep while still
     // broadcasting BLE ads. Two evidence channels:
     //
-    //   1. Advertisements (AdvertisingFlags): the "is the phone
-    //      here at all" signal. Stale (>rssiStaleWindowMs = 30s) =
-    //      gone.
-    //   2. RSSI: distance proxy. If fresh AND below threshold,
-    //      phone is at the edge of BLE range and should warn/lock
-    //      regardless of whether advertisements keep flowing.
+    //   1. Advertisements (AdvertisingFlags): the "is the phone here at
+    //      all" signal. Stale (>rssiStaleWindowMs = 30s) = gone.
+    //   2. RSSI: distance proxy. If fresh AND below threshold, phone is
+    //      at the edge of BLE range and should warn/lock regardless of
+    //      whether advertisements keep flowing.
     //
-    // Previously the disconnected path short-circuited on
-    // advertising alone — that left a sleeping OPPO at -65 dBm
-    // (just below the user's -64 threshold) treated as "in
-    // range" indefinitely. Bug seen live on the desk.
+    // Previously the disconnected path short-circuited on advertising
+    // alone — that left a phone advertising at -65 dBm (just below the
+    // user's -64 threshold) treated as "in range" indefinitely.
     var advFresh = service.advertisingEverObserved
       && service.lastAdvAt
       && (Date.now() - service.lastAdvAt) <= service.rssiStaleWindowMs
@@ -265,12 +265,11 @@ Item {
       if (exitCode !== 0) {
         var msg = String(rssiProc.stdout ? rssiProc.stdout.text : "")
         if (msg.indexOf("No such property") >= 0 && rssiPollTimer.running) {
-          // Phone does not advertise over BLE (ColorOS quirk, see
-          // omarchy-ble-paired-stops-rssi memory). Don't tear down the
-          // polling timer — keep evaluateProximity() running so we still
-          // check the connection state. RSSI stays 0; the rssiStaleMs
-          // timer inside phoneLost() will declare the phone "lost" after
-          // 6s if the property never reappears.
+          // Some phones don't expose RSSI over BLE even while advertising.
+          // Don't tear down the polling timer — keep evaluateProximity()
+          // running so we still check the connection state. RSSI stays 0;
+          // the rssiStaleMs timer inside phoneLost() will declare the
+          // phone "lost" after 6s if the property never reappears.
           console.log("bleguard: RSSI not exposed by BlueZ for " +
                       service.targetMac + " — connection-only proximity")
         }
@@ -288,9 +287,9 @@ Item {
       return
     }
     var path = dev.dbusPath
-    // Poll RSSI regardless of ACL state. The OPPO exposes RSSI even while
-    // BR/EDR is asleep (it stays in BlueZ's advertising cache), and on
-    // other devices a "No such property" response just leaves the timer
+    // Poll RSSI regardless of ACL state. Some phones expose RSSI even
+    // while BR/EDR is asleep (it stays in BlueZ's advertising cache),
+    // and on others a "No such property" response just leaves the timer
     // alive (see rssiProc.onExited). Skipping the poll when disconnected
     // leaves the chart frozen at the last reading.
     rssiProc.command = ["busctl", "get-property", "org.bluez",
@@ -474,7 +473,7 @@ Item {
       // manual `omarchy-system-lock` from a keybind).
       if (!service.autoLockSource) return
       // phoneLost() now also accepts recent BLE advertisements as
-      // presence (the ColorOS fast-sleep case), so a sleeping-but-
+      // presence (the sleep-but-broadcasting case), so a sleeping-but-
       // broadcasting phone on the desk counts as "phone is back".
       if (service.phoneLost()) {
         service.phoneBackSince = 0
@@ -493,9 +492,9 @@ Item {
       service.lastRssiAt = 0
       // Don't reset lastAdvAt: it's owned by advProc and consumed by
       // phoneLost(). evaluateProximity can't tell whether the disconnect
-      // is "phone genuinely gone" or "ColorOS fast sleep"; let the
-      // rssiStaleWindowMs (30s) keep advancing so phoneLost() eventually
-      // flips to true once advertisements stop arriving too.
+      // is "phone genuinely gone" or "phone is sleeping but broadcasting";
+      // let the rssiStaleWindowMs (30s) keep advancing so phoneLost()
+      // eventually flips to true once advertisements stop arriving too.
       service.phoneBackSince = 0
       // phoneLostSince accumulates across flaps — first time we see the
       // phone missing, stamp it; do NOT reset on brief reconnects below.

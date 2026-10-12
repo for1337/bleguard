@@ -36,7 +36,7 @@ readonly property string state: svc ? svc.state : "DISARMED"
   readonly property var lastRssiAt: svc && svc.lastRssiAt !== undefined ? Number(svc.lastRssiAt) : 0
   // Stamps only when the RSSI VALUE actually changes (not on every poll).
   // Used by the popup to flag BlueZ's cached readings — paired+bonded+
-  // trusted ColorOS devices stop exposing fresh RSSI from advertisements,
+  // trusted phones stop exposing fresh RSSI from advertisements,
   // so a long-elapsed change timestamp is the fingerprint of that quirk.
   readonly property var lastRssiValueChangeAt: svc && svc.lastRssiValueChangeAt !== undefined ? Number(svc.lastRssiValueChangeAt) : 0
   // Show a "cached" hint when the last real RSSI change is older than this.
@@ -53,7 +53,7 @@ readonly property string state: svc ? svc.state : "DISARMED"
   readonly property var rssiHistory: svc ? svc.rssiHistory : []
   // True once Service.qml has received at least one valid RSSI from BlueZ.
   // When false after the plugin has been armed, BlueZ is hiding RSSI for
-  // this device — almost always the ColorOS paired+trusted quirk — and
+  // this device — almost always the paired+trusted quirk — and
   // the chart will sit empty. We surface this as a non-"Collecting data…"
   // message so the user doesn't think the plugin is still loading.
   readonly property bool rssiEverObserved: svc ? svc.rssiEverObserved : false
@@ -345,7 +345,7 @@ readonly property string state: svc ? svc.state : "DISARMED"
 
             // Footer note when RSSI is stale or never observed. Two flavors: the
             // RSSI value stopped updating at all (BlueZ caches it for
-            // paired+bonded+trusted ColorOS devices — see omarchy-ble-
+            // paired+bonded+trusted devices — see omarchy-ble-
             // paired-stops-rssi memory), or it was never observed (older
             // BR/EDR-only phones that don't BLE-advertise). Either way
             // the plugin is still using BLE advertising as ground truth
@@ -353,7 +353,7 @@ readonly property string state: svc ? svc.state : "DISARMED"
             Text {
               visible: !root.rssiFresh && root.armed && root.targetMac !== ""
               text: root.lastRssi === 0
-                ? "RSSI not exposed by BlueZ for this device. Most often: paired+trusted phones (ColorOS) hide RSSI after bonding — BLE advertising still works, plugin still detects presence."
+                ? "RSSI not exposed by BlueZ for this device. Most often: paired+trusted phones hide RSSI after bonding — BLE advertising still works, plugin still detects presence."
                 : "Phone out of BLE range — no live RSSI."
               color: root.dim
               font.family: root.fontFamily
@@ -545,7 +545,7 @@ readonly property string state: svc ? svc.state : "DISARMED"
                     ctx.textBaseline = "middle"
                     // If the plugin is armed and has a target but BlueZ has
                     // never given us a usable RSSI, this is almost always
-                    // the paired+trusted ColorOS quirk — don't mislead the
+                    // the paired+trusted quirk — don't mislead the
                     // user with an indefinite "Collecting data…".
                     if (chart.armed && chart.targetSet && !chart.rssiEverObserved) {
                       ctx.fillText("No RSSI — BlueZ isn't exposing one for this device.",
