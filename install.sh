@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install.sh — symlink bleguard into ~/.config/omarchy/plugins/.
+# install.sh — copy bleguard plugin files into ~/.config/omarchy/plugins/bleguard/.
 # With --enable also adds it to shell.json and places the bar widget.
 # Re-running is safe; pass --force to overwrite a real folder at the target.
 
@@ -7,9 +7,11 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_ID="bleguard"
-PLUGIN_SRC="$REPO_DIR/$PLUGIN_ID"
 PLUGIN_DST="$HOME/.config/omarchy/plugins/$PLUGIN_ID"
 SHELL_JSON="$HOME/.config/omarchy/shell.json"
+
+# Files that make up the plugin (everything else in the repo is dev tooling).
+PLUGIN_FILES=(manifest.json Panel.qml Service.qml BleLogic.js)
 
 enable=""
 force=""
@@ -29,32 +31,39 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-if [ ! -d "$PLUGIN_SRC" ]; then
-  echo "error: $PLUGIN_SRC not found." >&2
-  exit 1
-fi
-
-# 1. Symlink into the plugins directory ------------------------------------
-mkdir -p "$(dirname "$PLUGIN_DST")"
-
-if [ -e "$PLUGIN_DST" ] || [ -L "$PLUGIN_DST" ]; then
-  if [ -L "$PLUGIN_DST" ] && [ "$(readlink "$PLUGIN_DST")" = "$PLUGIN_SRC" ]; then
-    echo "ok: $PLUGIN_DST already points at $PLUGIN_SRC"
-  elif [ "$force" = "1" ]; then
-    rm -rf "$PLUGIN_DST"
-    ln -s "$PLUGIN_SRC" "$PLUGIN_DST"
-    echo "ok: replaced $PLUGIN_DST with symlink to $PLUGIN_SRC"
-  else
-    echo "error: $PLUGIN_DST already exists (not a symlink to this repo)." >&2
-    echo "       Pass --force to overwrite, or remove it manually first." >&2
+for f in "${PLUGIN_FILES[@]}"; do
+  if [ ! -f "$REPO_DIR/$f" ]; then
+    echo "error: missing $REPO_DIR/$f (repo layout changed?)" >&2
     exit 1
   fi
-else
-  ln -s "$PLUGIN_SRC" "$PLUGIN_DST"
-  echo "ok: linked $PLUGIN_DST -> $PLUGIN_SRC"
+done
+
+# 1. Install plugin files -----------------------------------------------
+mkdir -p "$PLUGIN_DST"
+
+if [ -L "$PLUGIN_DST" ]; then
+  if [ "$force" = "1" ]; then
+    rm -f "$PLUGIN_DST"
+  else
+    echo "error: $PLUGIN_DST is a symlink. Pass --force to replace it with a real folder, or remove it manually first." >&2
+    exit 1
+  fi
 fi
 
-# 2. Optional: enable in shell.json ----------------------------------------
+if [ -d "$PLUGIN_DST" ] && [ "$force" != "1" ] && [ -f "$PLUGIN_DST/manifest.json" ]; then
+  echo "ok: $PLUGIN_DST already installed (manifest.json present). Pass --force to overwrite."
+else
+  if [ -d "$PLUGIN_DST" ] && [ "$force" = "1" ]; then
+    rm -rf "$PLUGIN_DST"
+    mkdir -p "$PLUGIN_DST"
+  fi
+  for f in "${PLUGIN_FILES[@]}"; do
+    cp "$REPO_DIR/$f" "$PLUGIN_DST/$f"
+  done
+  echo "ok: copied ${PLUGIN_FILES[*]} -> $PLUGIN_DST"
+fi
+
+# 2. Optional: enable in shell.json --------------------------------------
 if [ "$enable" = "1" ]; then
   if ! command -v jq >/dev/null 2>&1; then
     echo "error: --enable requires 'jq' to edit $SHELL_JSON safely." >&2
