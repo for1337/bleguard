@@ -25,15 +25,18 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-# 1. Symlink ---------------------------------------------------------------
+# 1. Plugin folder ---------------------------------------------------------
 if [ -L "$PLUGIN_DST" ]; then
   rm "$PLUGIN_DST"
   echo "ok: removed symlink $PLUGIN_DST"
+elif [ -d "$PLUGIN_DST" ]; then
+  rm -rf "$PLUGIN_DST"
+  echo "ok: removed $PLUGIN_DST"
 elif [ -e "$PLUGIN_DST" ]; then
-  echo "warning: $PLUGIN_DST exists but is not a symlink — left in place." >&2
+  echo "warning: $PLUGIN_DST exists but is not a folder or symlink — left in place." >&2
   echo "         Remove it manually if you want a full uninstall." >&2
 else
-  echo "ok: no symlink at $PLUGIN_DST (already uninstalled)"
+  echo "ok: no plugin folder at $PLUGIN_DST (already uninstalled)"
 fi
 
 # 2. shell.json entry ------------------------------------------------------
