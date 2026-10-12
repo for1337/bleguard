@@ -2,8 +2,6 @@
 
 I kept walking away from my desk for ten minutes and coming back to find my laptop unlocked and the dog asleep on the keyboard. The screen lock from the idle service is fine when I leave it on the desk; I wanted something stricter — "if my phone isn't next to the laptop, lock". This is a small Omarchy plugin that watches the BLE link to a paired phone, waits for a 30 s input idle, and locks via `omarchy-system-lock`. With the optional unlock patch installed, it also unlocks itself when the phone comes back, no password.
 
-![screenshot placeholder](screenshots/popup.png)
-
 ## what it does
 
 Polls `org.bluez.Device1.RSSI` and `AdvertisingFlags` over D-Bus every 2 s for the phone you picked in the popup, plus the Wayland `ext-idle-notify-v1` seat-idle counter (30 s threshold).
