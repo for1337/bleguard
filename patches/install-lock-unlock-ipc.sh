@@ -2,7 +2,7 @@
 # install-lock-unlock-ipc.sh
 #
 # Adds an `unlock` method to Omarchy's lock plugin IpcHandler so that
-# leo.bleguard can request an unlock via BLE-proximity proximity proof
+# bleguard can request an unlock via BLE-proximity proximity proof
 # without going through PAM. Idempotent: safe to re-run.
 #
 # Apply with sudo:
@@ -31,7 +31,7 @@ BLOCK='    function lock(): string {
       return "ok"
     }
 
-    // Added by leo.bleguard for BLE-proximity auto-unlock.
+    // Added by bleguard for BLE-proximity auto-unlock.
     // Bypasses PAM — caller proves presence via BLE proximity +
     // stable-presence timer. Security trade-off: a relay attacker within
     // BLE range could trigger this. Acceptable in trusted environments,
@@ -65,7 +65,7 @@ with open(path, 'w') as f:
 print("reverted")
 PY
 else
-  if grep -q "Added by leo.bleguard" "$LOCK"; then
+  if grep -q "Added by bleguard" "$LOCK"; then
     echo "already applied, skipping"
     exit 0
   fi
@@ -84,7 +84,7 @@ needle = '''    function lock(): string {
 if needle not in src:
     print("error: anchor not found in " + path)
     sys.exit(1)
-addon = '''    // Added by leo.bleguard for BLE-proximity auto-unlock.
+addon = '''    // Added by bleguard for BLE-proximity auto-unlock.
     // Bypasses PAM — caller proves presence via BLE proximity +
     // stable-presence timer. Security trade-off: a relay attacker within
     // BLE range could trigger this. Acceptable in trusted environments,

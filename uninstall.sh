@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-PLUGIN_ID="leo.bleguard"
+PLUGIN_ID="bleguard"
 PLUGIN_DST="$HOME/.config/omarchy/plugins/$PLUGIN_ID"
 SHELL_JSON="$HOME/.config/omarchy/shell.json"
 STATE_JSON="$HOME/.local/state/omarchy/bleguard-state.json"
