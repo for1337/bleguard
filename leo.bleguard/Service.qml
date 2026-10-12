@@ -71,6 +71,14 @@ Item {
   // the lower 32 bits (~664e6), giving nonsense time deltas.
   property var lastRssi: 0
   property var lastRssiAt: 0
+  // Stamps Date.now() ONLY when the RSSI value actually changes between
+  // busctl polls. Used by the popup to flag cached readings — BlueZ
+  // stops tracking RSSI for paired+bonded+trusted ColorOS devices, so
+  // a long-elapsed change timestamp is the fingerprint of that quirk
+  // (see omarchy-ble-paired-stops-rssi memory). Does NOT update when
+  // the value is the same as before: a stationary phone genuinely stays
+  // at one value, and we'd rather not flag a real "still here" as stale.
+  property var lastRssiValueChangeAt: 0
 
   // "Phone is advertising" evidence. BlueZ populates AdvertisingFlags /
   // ManufacturerData when an advertisement is processed while Discovering=true,
@@ -229,6 +237,9 @@ Item {
         var n = Ble.parseBusctlRssi(text || "")
         if (n !== null && n !== 0) {
           var now = Date.now()
+          if (service.lastRssi !== n) {
+            service.lastRssiValueChangeAt = now
+          }
           service.lastRssi = n
           service.lastRssiAt = now
           service.rssiEverObserved = true
@@ -655,6 +666,7 @@ Item {
         targetMac: service.targetMac,
         rssi: service.lastRssi,
         rssiAt: service.lastRssiAt,
+        rssiValueChangeAt: service.lastRssiValueChangeAt,
         advAt: service.lastAdvAt,
         advertisingEverObserved: service.advertisingEverObserved,
         distance: service.distanceMeters,
