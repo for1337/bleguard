@@ -98,36 +98,11 @@ Item {
   function phoneLost() {
     var dev = service.findTargetDevice()
     var connected = dev ? dev.connected : false
-    if (!connected) return true
 
-    // If the last RSSI was very long ago (or never observed), BlueZ has
-    // likely stopped exposing it (omarchy-ble-paired-stops-rssi quirk on
-    // ColorOS). Fall back to "connection-only proximity" — the phone is
-    // "in range" iff it's connected. This keeps auto-unlock working when
-    // the user returns with the phone.
-    var rssiFresh = service.rssiEverObserved
-      && lastRssiAt
-      && (Date.now() - lastRssiAt) <= service.rssiStaleWindowMs
-    if (!rssiFresh) {
-      // Connected, but no usable RSSI. Trust the ACL only.
-      return false
-    }
-
-    if (lastRssi !== 0 && lastRssi < service.rssiThreshold) return true
-    return false
-  }
-
-  // Stricter "phone is gone" used only by the auto-unlock path. The warning
-  // path keeps using phoneLost() (disconnected = lost) so genuinely-walked-
-  // away phones still trigger the lock. For auto-unlock we accept either a
-  // live ACL or a recent advertisement as "phone is here", because the
-  // ColorOS "fast sleep" cycle drops BR/EDR while BLE advertisements keep
-  // flowing from a phone sitting on the desk.
-  function phoneReallyGone() {
-    var dev = service.findTargetDevice()
-    var connected = dev ? dev.connected : false
+    // BR/EDR ACL up: treat as "nearby" regardless of RSSI staleness.
+    // ColorOS quirk: once Paired=Bonded=Trusted, BlueZ stops exposing RSSI
+    // while ACL is up. Presence is the ACL.
     if (connected) {
-      // Reuse the same ACL fallback semantics as phoneLost().
       var rssiFresh = service.rssiEverObserved
         && lastRssiAt
         && (Date.now() - lastRssiAt) <= service.rssiStaleWindowMs
@@ -135,8 +110,12 @@ Item {
       if (lastRssi !== 0 && lastRssi < service.rssiThreshold) return true
       return false
     }
-    // Disconnected. Treat advertising presence within the stale window as
-    // "nearby" — phone is sleeping but broadcasting, user is at the desk.
+
+    // BR/EDR ACL down — but ColorOS drops ACL during "fast sleep" while
+    // continuing to broadcast BLE advertisements. Treat fresh advertising
+    // within rssiStaleWindowMs (30s) as presence: the phone is on the desk
+    // sleeping, and the user is sitting in front of it. This is the case
+    // that produced the lock/unlock loop before this fix.
     var advFresh = service.advertisingEverObserved
       && service.lastAdvAt
       && (Date.now() - service.lastAdvAt) <= service.rssiStaleWindowMs
@@ -324,7 +303,7 @@ Item {
     }
     onExited: function(exitCode) {
       // "No such property" on a non-advertising device: silent. Just don't
-      // update lastAdvAt; phoneReallyGone() will treat presence as unknown.
+      // update lastAdvAt; phoneLost() will treat presence as unknown.
       if (exitCode !== 0) {
         var msg = String(advProc.stdout ? advProc.stdout.text : "")
         if (msg.indexOf("No such property") < 0) {
@@ -470,12 +449,10 @@ Item {
       // Auto-unlock path: only if this plugin triggered the lock (not a
       // manual `omarchy-system-lock` from a keybind).
       if (!service.autoLockSource) return
-      // Use phoneReallyGone() (NOT phoneLost()) here. phoneLost() treats
-      // BR/EDR disconnect = lost, which prevents auto-unlock when the
-      // ColorOS phone is sleeping-but-broadcasting. phoneReallyGone()
-      // accepts recent BLE advertisements as presence evidence so a
-      // sleeping phone on the desk still counts as "phone is back".
-      if (service.phoneReallyGone()) {
+      // phoneLost() now also accepts recent BLE advertisements as
+      // presence (the ColorOS fast-sleep case), so a sleeping-but-
+      // broadcasting phone on the desk counts as "phone is back".
+      if (service.phoneLost()) {
         service.phoneBackSince = 0
       } else if (service.phoneBackSince === 0) {
         service.phoneBackSince = Date.now()
@@ -490,11 +467,11 @@ Item {
       // value that BlueZ still has in memory but the device is actually gone.
       service.lastRssi = 0
       service.lastRssiAt = 0
-      // Don't reset lastAdvAt: it's owned by advProc and consumed by the
-      // LOCKED-state auto-unlock path. evaluateProximity can't tell whether
-      // the disconnect is "phone genuinely gone" or "ColorOS fast sleep";
-      // let the rssiStaleWindowMs (30s) keep advancing so phoneReallyGone()
-      // eventually flips to true once advertisements stop arriving too.
+      // Don't reset lastAdvAt: it's owned by advProc and consumed by
+      // phoneLost(). evaluateProximity can't tell whether the disconnect
+      // is "phone genuinely gone" or "ColorOS fast sleep"; let the
+      // rssiStaleWindowMs (30s) keep advancing so phoneLost() eventually
+      // flips to true once advertisements stop arriving too.
       service.phoneBackSince = 0
       // phoneLostSince accumulates across flaps — first time we see the
       // phone missing, stamp it; do NOT reset on brief reconnects below.
