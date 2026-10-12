@@ -107,9 +107,8 @@ Item {
     var dev = service.findTargetDevice()
     var connected = dev ? dev.connected : false
 
-    // BR/EDR ACL up: treat as "nearby" regardless of RSSI staleness.
-    // ColorOS quirk: once Paired=Bonded=Trusted, BlueZ stops exposing RSSI
-    // while ACL is up. Presence is the ACL.
+    // BR/EDR ACL up: trust the ACL when RSSI is stale (ColorOS quirk
+    // while connected). Apply threshold when RSSI is fresh.
     if (connected) {
       var rssiFresh = service.rssiEverObserved
         && lastRssiAt
@@ -119,15 +118,29 @@ Item {
       return false
     }
 
-    // BR/EDR ACL down — but ColorOS drops ACL during "fast sleep" while
-    // continuing to broadcast BLE advertisements. Treat fresh advertising
-    // within rssiStaleWindowMs (30s) as presence: the phone is on the desk
-    // sleeping, and the user is sitting in front of it. This is the case
-    // that produced the lock/unlock loop before this fix.
+    // BR/EDR ACL down — ColorOS fast-sleep drops ACL while still
+    // broadcasting BLE ads. Two evidence channels:
+    //
+    //   1. Advertisements (AdvertisingFlags): the "is the phone
+    //      here at all" signal. Stale (>rssiStaleWindowMs = 30s) =
+    //      gone.
+    //   2. RSSI: distance proxy. If fresh AND below threshold,
+    //      phone is at the edge of BLE range and should warn/lock
+    //      regardless of whether advertisements keep flowing.
+    //
+    // Previously the disconnected path short-circuited on
+    // advertising alone — that left a sleeping OPPO at -65 dBm
+    // (just below the user's -64 threshold) treated as "in
+    // range" indefinitely. Bug seen live on the desk.
     var advFresh = service.advertisingEverObserved
       && service.lastAdvAt
       && (Date.now() - service.lastAdvAt) <= service.rssiStaleWindowMs
-    return !advFresh
+    if (!advFresh) return true
+    var rssiFresh = service.rssiEverObserved
+      && lastRssiAt
+      && (Date.now() - lastRssiAt) <= service.rssiStaleWindowMs
+    if (rssiFresh && lastRssi !== 0 && lastRssi < service.rssiThreshold) return true
+    return false
   }
 
   // ---- Persisted state --------------------------------------------------
