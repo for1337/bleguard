@@ -12,8 +12,8 @@ import "BleLogic.js" as Ble
 
 Panel {
   id: root
-  moduleName: "leo.bleguard"
-  ipcTarget: "leo.bleguard"
+  moduleName: "bleguard"
+  ipcTarget: "bleguard"
 
   // Without these, root.bar.shell.serviceFor() returns null and the panel stays empty.
   property var shell: null
@@ -24,7 +24,7 @@ Panel {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  readonly property var svc: root.bar && root.bar.shell ? root.bar.shell.serviceFor("leo.bleguard") : null
+  readonly property var svc: root.bar && root.bar.shell ? root.bar.shell.serviceFor("bleguard") : null
 
   // IMPORTANT: lastRssiAt is var in Service.qml because Date.now() in 2026
   // is ~1.79e12 ms — fits in a JS double but overflows QML's 32-bit int.
@@ -198,70 +198,66 @@ readonly property string state: svc ? svc.state : "DISARMED"
 
             Rectangle {
               Layout.fillWidth: true
-              Layout.preferredHeight: Math.min(Style.space(280),
-                Style.space(36) + Math.max(0, root.svc ? root.svc.listPaired().length : 0) * Style.space(32))
+              Layout.preferredHeight: Style.space(40)
               color: root.surface
               radius: Style.cornerRadius
               border.color: Qt.darker(root.surface, 1.3)
               border.width: 1
 
-              ListView {
-                id: pairList
+              ComboBox {
+                id: pairCombo
                 anchors.fill: parent
                 anchors.margins: Style.space(4)
-                clip: true
-                currentIndex: -1
-                spacing: 2
+                enabled: root.svc && root.svc.listPaired().length > 0
                 model: root.svc ? root.svc.listPaired() : []
-                boundsBehavior: Flickable.StopAtBounds
+                textRole: "name"
+                valueRole: "address"
 
-                delegate: Rectangle {
-                  width: pairList.width
-                  height: Style.space(32)
-                  color: index % 2 === 0 ? root.surface : Qt.lighter(root.surface, 2.0)
-                  radius: Style.cornerRadius / 2
-
-                  RowLayout {
-                    anchors.fill: parent
-                    anchors.leftMargin: Style.space(8)
-                    anchors.rightMargin: Style.space(12)
-
-                    Text {
-                      text: modelData.name || "(unnamed)"
-                      color: root.foreground
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.font.bodySmall
-                      font.bold: true
-                      elide: Text.ElideRight
-                      Layout.preferredWidth: Style.space(200)
-                    }
-                    Text {
-                      text: modelData.address
-                      color: root.dim
-                      font.family: "monospace"
-                      font.pixelSize: Style.font.caption
-                      Layout.preferredWidth: Style.space(140)
-                    }
-                    Item { Layout.fillWidth: true }
-                    Button {
-                      text: "Pick"
-                      foreground: root.foreground
-                      fontFamily: root.fontFamily
-                      onClicked: if (root.svc) root.svc.setTarget(modelData.address)
+                // Keep the dropdown synchronized with the persisted target
+                // so reopening the popup shows the currently paired phone
+                // selected, even after a shell restart.
+                Connections {
+                  target: root.svc
+                  function onTargetMacChanged() { pairCombo.syncToTarget() }
+                }
+                function syncToTarget() {
+                  var paired = root.svc ? root.svc.listPaired() : []
+                  var cur = (root.targetMac || "").toLowerCase()
+                  for (var i = 0; i < paired.length; i++) {
+                    if ((paired[i].address || "").toLowerCase() === cur) {
+                      currentIndex = i
+                      return
                     }
                   }
+                  currentIndex = -1
+                }
+                Component.onCompleted: syncToTarget()
+
+                // Show "<name>  ·  <mac>" in the collapsed trigger so the user
+                // can confirm the MAC of the selected phone at a glance.
+                displayText: {
+                  if (currentIndex < 0) return "Pick device…"
+                  var item = model[currentIndex]
+                  if (!item) return ""
+                  var mac = item.address || ""
+                  return (item.name || "(unnamed)") + (mac ? "  ·  " + mac : "")
                 }
 
-                Text {
-                  anchors.centerIn: parent
-                  visible: pairList.count === 0
-                  text: "No paired BLE devices found.\nPair your phone with `bluetoothctl pair <mac>` first."
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.bodySmall
-                  horizontalAlignment: Text.AlignHCenter
-                }
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                onActivated: if (root.svc && currentValue) root.svc.setTarget(currentValue)
               }
+            }
+
+            Text {
+              visible: root.svc && root.svc.listPaired().length === 0
+              text: "No paired BLE devices found.\nPair your phone with `bluetoothctl pair <mac>` first."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+              Layout.fillWidth: true
+              Layout.topMargin: Style.space(8)
             }
           }
         }

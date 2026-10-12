@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# install.sh — symlink leo.bleguard into ~/.config/omarchy/plugins/.
+# install.sh — symlink bleguard into ~/.config/omarchy/plugins/.
 # With --enable also adds it to shell.json and places the bar widget.
 # Re-running is safe; pass --force to overwrite a real folder at the target.
 
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PLUGIN_ID="leo.bleguard"
+PLUGIN_ID="bleguard"
 PLUGIN_SRC="$REPO_DIR/$PLUGIN_ID"
 PLUGIN_DST="$HOME/.config/omarchy/plugins/$PLUGIN_ID"
 SHELL_JSON="$HOME/.config/omarchy/shell.json"

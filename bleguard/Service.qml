@@ -194,7 +194,7 @@ Item {
     printErrors: false
     onLoaded: service.hydrate(text() || "")
     onLoadFailed: function(error) {
-      console.warn("leo.bleguard: state load failed:", error, "— starting fresh")
+      console.warn("bleguard: state load failed:", error, "— starting fresh")
       service.hydrate("")
     }
   }
@@ -211,7 +211,7 @@ Item {
           if (typeof parsed.rssiThreshold === "number") persisted.rssiThreshold = parsed.rssiThreshold
         }
       } catch (e) {
-        console.warn("leo.bleguard: malformed state file:", e)
+        console.warn("bleguard: malformed state file:", e)
       }
     }
     service.state = service.armed ? "ARMED" : "DISARMED"
@@ -271,7 +271,7 @@ Item {
           // check the connection state. RSSI stays 0; the rssiStaleMs
           // timer inside phoneLost() will declare the phone "lost" after
           // 6s if the property never reappears.
-          console.log("leo.bleguard: RSSI not exposed by BlueZ for " +
+          console.log("bleguard: RSSI not exposed by BlueZ for " +
                       service.targetMac + " — connection-only proximity")
         }
       }
@@ -332,7 +332,7 @@ Item {
         var msg = String(advProc.stdout ? advProc.stdout.text : "")
         if (msg.indexOf("No such property") < 0) {
           // Some other error — log so it surfaces in qslog.
-          console.log("leo.bleguard: advProc exit " + exitCode + ": " + msg.trim())
+          console.log("bleguard: advProc exit " + exitCode + ": " + msg.trim())
         }
       }
     }
@@ -580,7 +580,7 @@ Item {
   function postGraceNotification() {
     Quickshell.execDetached([
       "omarchy-notification-send",
-      "--app-name", "leo.bleguard",
+      "--app-name", "bleguard",
       "-u", "normal",
       "-t", "12000",
       "-i", "bluetooth-symbolic",
@@ -655,10 +655,10 @@ Item {
     return out
   }
 
-  // Custom control IPC on a separate target — `leo.bleguard` itself is
+  // Custom control IPC on a separate target — `bleguard` itself is
   // already claimed by the base Omarchy Panel's IpcHandler (show/hide/toggle).
   IpcHandler {
-    target: "leo.bleguard.ctrl"
+    target: "bleguard.ctrl"
 
     function arm(): string {
       service.setArmed(true)

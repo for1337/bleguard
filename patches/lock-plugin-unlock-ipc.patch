@@ -10,8 +10,8 @@
        return "ok"
      }
 
-+    // Added by leo.bleguard for BLE-proximity auto-unlock.
-+    // Bypasses PAM — the caller (leo.bleguard) is responsible for proving
++    // Added by bleguard for BLE-proximity auto-unlock.
++    // Bypasses PAM — the caller (bleguard) is responsible for proving
 +    // presence via BLE proximity + a stable-presence timer. Security trade-off:
 +    // a relay attacker within BLE range could trigger this. Acceptable in
 +    // trusted environments, equivalent to macOS / Windows smart-unlock.
