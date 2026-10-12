@@ -71,7 +71,8 @@ else
   fi
   python3 - "$LOCK" <<'PY'
 import sys
-path, replacement = sys.argv[1], sys.argv[2]
+path = sys.argv[1]
+replacement = sys.argv[2] if len(sys.argv) > 2 else None
 src = open(path).read()
 needle = '''    function lock(): string {
       if (!root.passwordPamConfigured) return "missing-pam"
