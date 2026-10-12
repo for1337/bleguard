@@ -51,6 +51,12 @@ readonly property string state: svc ? svc.state : "DISARMED"
   readonly property int threshold: svc ? svc.rssiThreshold : -85
   readonly property bool idle: svc ? svc.idle : false
   readonly property var rssiHistory: svc ? svc.rssiHistory : []
+  // True once Service.qml has received at least one valid RSSI from BlueZ.
+  // When false after the plugin has been armed, BlueZ is hiding RSSI for
+  // this device — almost always the ColorOS paired+trusted quirk — and
+  // the chart will sit empty. We surface this as a non-"Collecting data…"
+  // message so the user doesn't think the plugin is still loading.
+  readonly property bool rssiEverObserved: svc ? svc.rssiEverObserved : false
 
   // True only when we have a *fresh* RSSI reading (polled within 15s).
   // BlueZ caches the last value in memory even after the device disappears,
@@ -412,6 +418,9 @@ readonly property string state: svc ? svc.state : "DISARMED"
               readonly property int thr: root.threshold
               readonly property int rssiMin: -100
               readonly property int rssiMax: -30
+              readonly property bool rssiEverObserved: root.rssiEverObserved
+              readonly property bool armed: root.armed
+              readonly property bool targetSet: root.targetMac !== ""
 
               Canvas {
                 id: chart
@@ -424,6 +433,9 @@ readonly property string state: svc ? svc.state : "DISARMED"
                 property int thr: chartFrame.thr
                 property int rssiMin: chartFrame.rssiMin
                 property int rssiMax: chartFrame.rssiMax
+                property bool rssiEverObserved: chartFrame.rssiEverObserved
+                property bool armed: chartFrame.armed
+                property bool targetSet: chartFrame.targetSet
 
                 onHistoryChanged: chart.requestPaint()
                 onThrChanged: chart.requestPaint()
@@ -431,6 +443,9 @@ readonly property string state: svc ? svc.state : "DISARMED"
                 onRssiMaxChanged: chart.requestPaint()
                 onWidthChanged: chart.requestPaint()
                 onHeightChanged: chart.requestPaint()
+                onRssiEverObservedChanged: chart.requestPaint()
+                onArmedChanged: chart.requestPaint()
+                onTargetSetChanged: chart.requestPaint()
 
                 // Safety net: repaint at 1 Hz in case the history signal
                 // ever stops propagating (e.g. array reassigned to itself).
@@ -493,7 +508,19 @@ readonly property string state: svc ? svc.state : "DISARMED"
                     ctx.fillStyle = root.dim
                     ctx.textAlign = "center"
                     ctx.textBaseline = "middle"
-                    ctx.fillText("Collecting data…", width / 2, height / 2)
+                    // If the plugin is armed and has a target but BlueZ has
+                    // never given us a usable RSSI, this is almost always
+                    // the paired+trusted ColorOS quirk — don't mislead the
+                    // user with an indefinite "Collecting data…".
+                    if (chart.armed && chart.targetSet && !chart.rssiEverObserved) {
+                      ctx.fillText("No RSSI — BlueZ isn't exposing one for this device.",
+                                   width / 2, height / 2 - 8)
+                      ctx.font = "8px monospace"
+                      ctx.fillText("Plugin still uses BLE advertising for proximity.",
+                                   width / 2, height / 2 + 8)
+                    } else {
+                      ctx.fillText("Collecting data…", width / 2, height / 2)
+                    }
                     return
                   }
 
