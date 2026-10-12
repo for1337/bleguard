@@ -185,79 +185,97 @@ readonly property string state: svc ? svc.state : "DISARMED"
             id: pairingBlock
             anchors.fill: parent
             spacing: Style.space(8)
-            visible: root.armed && !root.targetMac
+            visible: root.armed && !root.targetMac && root.svc && root.svc.listPaired().length === 0
 
             Text {
-              text: "No phone paired yet. Pick the device you carry with you:"
+              text: "No phone paired yet. Pick the device you carry with you from the menu above — or pair it first with `bluetoothctl pair <mac>`."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
               wrapMode: Text.WordWrap
               Layout.fillWidth: true
             }
+          }
+        }
 
-            Rectangle {
+        // ---- Device picker (always visible when armed) -----------------
+        // Hoisted out of pairingBlock so the user can change device or
+        // unpair from the popup at any time — not only during the
+        // first-time setup wizard.
+        Item {
+          Layout.fillWidth: true
+          Layout.preferredHeight: devicePicker.visible ? devicePicker.implicitHeight + Style.space(8) : 0
+          visible: root.armed
+
+          ColumnLayout {
+            id: devicePicker
+            anchors.fill: parent
+            spacing: Style.space(8)
+
+            RowLayout {
               Layout.fillWidth: true
-              Layout.preferredHeight: Style.space(40)
-              color: root.surface
-              radius: Style.cornerRadius
-              border.color: Qt.darker(root.surface, 1.3)
-              border.width: 1
+              spacing: Style.space(8)
 
-              ComboBox {
-                id: pairCombo
-                anchors.fill: parent
-                anchors.margins: Style.space(4)
-                enabled: root.svc && root.svc.listPaired().length > 0
-                model: root.svc ? root.svc.listPaired() : []
-                textRole: "name"
-                valueRole: "address"
+              Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Style.space(40)
+                color: root.surface
+                radius: Style.cornerRadius
+                border.color: Qt.darker(root.surface, 1.3)
+                border.width: 1
 
-                // Keep the dropdown synchronized with the persisted target
-                // so reopening the popup shows the currently paired phone
-                // selected, even after a shell restart.
-                Connections {
-                  target: root.svc
-                  function onTargetMacChanged() { pairCombo.syncToTarget() }
-                }
-                function syncToTarget() {
-                  var paired = root.svc ? root.svc.listPaired() : []
-                  var cur = (root.targetMac || "").toLowerCase()
-                  for (var i = 0; i < paired.length; i++) {
-                    if ((paired[i].address || "").toLowerCase() === cur) {
-                      currentIndex = i
-                      return
-                    }
+                ComboBox {
+                  id: pairCombo
+                  anchors.fill: parent
+                  anchors.margins: Style.space(4)
+                  enabled: root.svc && root.svc.listPaired().length > 0
+                  model: root.svc ? root.svc.listPaired() : []
+                  textRole: "name"
+                  valueRole: "address"
+
+                  // Keep the dropdown synchronized with the persisted
+                  // target so reopening the popup shows the currently
+                  // paired phone selected, even after a shell restart.
+                  Connections {
+                    target: root.svc
+                    function onTargetMacChanged() { pairCombo.syncToTarget() }
                   }
-                  currentIndex = -1
-                }
-                Component.onCompleted: syncToTarget()
+                  function syncToTarget() {
+                    var paired = root.svc ? root.svc.listPaired() : []
+                    var cur = (root.targetMac || "").toLowerCase()
+                    for (var i = 0; i < paired.length; i++) {
+                      if ((paired[i].address || "").toLowerCase() === cur) {
+                        currentIndex = i
+                        return
+                      }
+                    }
+                    currentIndex = -1
+                  }
+                  Component.onCompleted: syncToTarget()
 
-                // Show "<name>  ·  <mac>" in the collapsed trigger so the user
-                // can confirm the MAC of the selected phone at a glance.
-                displayText: {
-                  if (currentIndex < 0) return "Pick device…"
-                  var item = model[currentIndex]
-                  if (!item) return ""
-                  var mac = item.address || ""
-                  return (item.name || "(unnamed)") + (mac ? "  ·  " + mac : "")
-                }
+                  // Show "<name>  ·  <mac>" in the collapsed trigger so
+                  // the user can confirm the MAC of the selected phone.
+                  displayText: {
+                    if (currentIndex < 0) return "Pick device…"
+                    var item = model[currentIndex]
+                    if (!item) return ""
+                    var mac = item.address || ""
+                    return (item.name || "(unnamed)") + (mac ? "  ·  " + mac : "")
+                  }
 
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-                onActivated: if (root.svc && currentValue) root.svc.setTarget(currentValue)
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  onActivated: if (root.svc && currentValue) root.svc.setTarget(currentValue)
+                }
               }
-            }
 
-            Text {
-              visible: root.svc && root.svc.listPaired().length === 0
-              text: "No paired BLE devices found.\nPair your phone with `bluetoothctl pair <mac>` first."
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
-              Layout.fillWidth: true
-              Layout.topMargin: Style.space(8)
+              Button {
+                text: "Unpair"
+                visible: root.targetMac !== ""
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                onClicked: if (root.svc) root.svc.setTarget("")
+              }
             }
           }
         }
