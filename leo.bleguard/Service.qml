@@ -72,6 +72,16 @@ Item {
   property var lastRssi: 0
   property var lastRssiAt: 0
 
+  // "Phone is advertising" evidence. BlueZ populates AdvertisingFlags /
+  // ManufacturerData when an advertisement is processed while Discovering=true,
+  // even if the BR/EDR ACL is asleep (ColorOS "fast sleep" pattern). We treat
+  // recent advertising presence as a strong "phone is here" signal — used
+  // ONLY by the auto-unlock path so the laptop can be re-armed when the user
+  // comes back with a sleeping-but-broadcasting phone. WARNING/AUTO-LOCK
+  // paths continue to use phoneLost() which treats disconnected=lost.
+  property var lastAdvAt: 0
+  property bool advertisingEverObserved: false
+
   // Rolling RSSI history for the popup chart. Each entry: {t: ms, rssi: dBm}.
   // Only real busctl readings — never the synthetic `lastRssi = 0` we set
   // when the phone drops, otherwise the chart would lie about presence.
@@ -105,6 +115,32 @@ Item {
 
     if (lastRssi !== 0 && lastRssi < service.rssiThreshold) return true
     return false
+  }
+
+  // Stricter "phone is gone" used only by the auto-unlock path. The warning
+  // path keeps using phoneLost() (disconnected = lost) so genuinely-walked-
+  // away phones still trigger the lock. For auto-unlock we accept either a
+  // live ACL or a recent advertisement as "phone is here", because the
+  // ColorOS "fast sleep" cycle drops BR/EDR while BLE advertisements keep
+  // flowing from a phone sitting on the desk.
+  function phoneReallyGone() {
+    var dev = service.findTargetDevice()
+    var connected = dev ? dev.connected : false
+    if (connected) {
+      // Reuse the same ACL fallback semantics as phoneLost().
+      var rssiFresh = service.rssiEverObserved
+        && lastRssiAt
+        && (Date.now() - lastRssiAt) <= service.rssiStaleWindowMs
+      if (!rssiFresh) return false
+      if (lastRssi !== 0 && lastRssi < service.rssiThreshold) return true
+      return false
+    }
+    // Disconnected. Treat advertising presence within the stale window as
+    // "nearby" — phone is sleeping but broadcasting, user is at the desk.
+    var advFresh = service.advertisingEverObserved
+      && service.lastAdvAt
+      && (Date.now() - service.lastAdvAt) <= service.rssiStaleWindowMs
+    return !advFresh
   }
 
   // ---- Persisted state --------------------------------------------------
@@ -182,6 +218,7 @@ Item {
     if (service.armed && service.targetMac) {
       rssiPollTimer.start()
       service.lastRssiAt = Date.now()  // grace window while first poll runs
+      service.lastAdvAt = Date.now()   // grace window for advertising too
     }
   }
 
@@ -239,16 +276,63 @@ Item {
   }
 
   function startRssiPoll() {
-    // Make sure BlueZ is scanning so RSSI is observable.
+    // Make sure BlueZ is scanning so RSSI + AdvertisingFlags are observable.
     setBluezDiscovery(true)
     var dev = service.findTargetDevice()
-    if (!dev || !dev.connected || !dev.dbusPath) {
+    if (!dev || !dev.dbusPath) {
       rssiProc.running = false
+      advProc.running = false
       return
     }
+    var path = dev.dbusPath
+    // Poll RSSI regardless of ACL state. The OPPO exposes RSSI even while
+    // BR/EDR is asleep (it stays in BlueZ's advertising cache), and on
+    // other devices a "No such property" response just leaves the timer
+    // alive (see rssiProc.onExited). Skipping the poll when disconnected
+    // leaves the chart frozen at the last reading.
     rssiProc.command = ["busctl", "get-property", "org.bluez",
-                        dev.dbusPath, "org.bluez.Device1", "RSSI"]
+                        path, "org.bluez.Device1", "RSSI"]
     rssiProc.running = true
+    advProc.command = ["busctl", "get-property", "org.bluez",
+                       path, "org.bluez.Device1", "AdvertisingFlags"]
+    advProc.running = true
+  }
+
+  // Tracks the AdvertisingFlags property: when BlueZ processes an
+  // advertisement, it overwrites this with the current flags. A non-empty
+  // byte array proves a recent advertisement was received — strong presence
+  // evidence even when BR/EDR is asleep. Stops trusting only after the
+  // value has been stale for rssiStaleWindowMs (30 s by default).
+  Process {
+    id: advProc
+    command: ["busctl", "get-property", "org.bluez",
+              "/placeholder", "org.bluez.Device1", "AdvertisingFlags"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        // busctl prints "ay <count> <bytes...>". Empty when no advertisement
+        // is cached: "ay 0" or "ay 0\n". Any entry with count > 0 = evidence.
+        var out = String(text || "").trim()
+        var m = out.match(/^ay\s+(\d+)/)
+        var count = m ? parseInt(m[1], 10) : 0
+        if (count > 0) {
+          service.lastAdvAt = Date.now()
+          service.advertisingEverObserved = true
+          service.evaluateProximity()
+        }
+      }
+    }
+    onExited: function(exitCode) {
+      // "No such property" on a non-advertising device: silent. Just don't
+      // update lastAdvAt; phoneReallyGone() will treat presence as unknown.
+      if (exitCode !== 0) {
+        var msg = String(advProc.stdout ? advProc.stdout.text : "")
+        if (msg.indexOf("No such property") < 0) {
+          // Some other error — log so it surfaces in qslog.
+          console.log("leo.bleguard: advProc exit " + exitCode + ": " + msg.trim())
+        }
+      }
+    }
   }
 
   // Append a fresh RSSI sample, trim older entries outside the window.
@@ -269,6 +353,7 @@ Item {
 
   function stopRssiPoll() {
     rssiProc.running = false
+    advProc.running = false
     setBluezDiscovery(false)
   }
 
@@ -344,6 +429,7 @@ Item {
           service.autoLockSource = false
           service.phoneBackSince = 0
           service.lastRssiAt = Date.now()  // reset stale window
+          service.lastAdvAt = Date.now()   // reset advertising stale window
           lockCheckTimer.stop()
           service.evaluateProximity()
         }
@@ -384,8 +470,12 @@ Item {
       // Auto-unlock path: only if this plugin triggered the lock (not a
       // manual `omarchy-system-lock` from a keybind).
       if (!service.autoLockSource) return
-      if (service.phoneLost()) {
-        // Phone is gone again — clear the unlock timer, stay locked.
+      // Use phoneReallyGone() (NOT phoneLost()) here. phoneLost() treats
+      // BR/EDR disconnect = lost, which prevents auto-unlock when the
+      // ColorOS phone is sleeping-but-broadcasting. phoneReallyGone()
+      // accepts recent BLE advertisements as presence evidence so a
+      // sleeping phone on the desk still counts as "phone is back".
+      if (service.phoneReallyGone()) {
         service.phoneBackSince = 0
       } else if (service.phoneBackSince === 0) {
         service.phoneBackSince = Date.now()
@@ -400,6 +490,11 @@ Item {
       // value that BlueZ still has in memory but the device is actually gone.
       service.lastRssi = 0
       service.lastRssiAt = 0
+      // Don't reset lastAdvAt: it's owned by advProc and consumed by the
+      // LOCKED-state auto-unlock path. evaluateProximity can't tell whether
+      // the disconnect is "phone genuinely gone" or "ColorOS fast sleep";
+      // let the rssiStaleWindowMs (30s) keep advancing so phoneReallyGone()
+      // eventually flips to true once advertisements stop arriving too.
       service.phoneBackSince = 0
       // phoneLostSince accumulates across flaps — first time we see the
       // phone missing, stamp it; do NOT reset on brief reconnects below.
@@ -458,6 +553,7 @@ Item {
     service.state = "ARMED"
     service.phoneLostSince = 0
     service.lastRssiAt = Date.now()  // reset stale window
+    service.lastAdvAt = Date.now()   // reset advertising stale window
   }
 
   function onGraceExpired() {
@@ -508,6 +604,7 @@ Item {
     // Fresh pairing — reset the stale window so we don't immediately fire
     // a WARNING because RSSI hasn't been polled yet.
     service.lastRssiAt = Date.now()
+    service.lastAdvAt = Date.now()
     service.state = service.armed ? "ARMED" : "DISARMED"
     if (service.armed && persisted.targetMac) {
       rssiPollTimer.start()
@@ -536,6 +633,7 @@ Item {
         // BlueZ never exposes RSSI for a paired device, phoneLost() can
         // never trigger because both rssiAt and rssi stay at 0.
         service.lastRssiAt = Date.now()
+        service.lastAdvAt = Date.now()
       }
       service.evaluateProximity()
     }
@@ -575,9 +673,13 @@ Item {
       return JSON.stringify({
         state: service.state,
         armed: service.armed,
+        autoLockSource: service.autoLockSource,
+        phoneBackSince: service.phoneBackSince,
         targetMac: service.targetMac,
         rssi: service.lastRssi,
         rssiAt: service.lastRssiAt,
+        advAt: service.lastAdvAt,
+        advertisingEverObserved: service.advertisingEverObserved,
         distance: service.distanceMeters,
         historyPoints: service.rssiHistory.length,
         history: service.rssiHistory,
