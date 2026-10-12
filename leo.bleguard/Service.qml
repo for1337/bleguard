@@ -25,6 +25,17 @@ Item {
   // Default RSSI floor. Tunable per-VM later; for now hardcoded.
   readonly property int defaultRssiThreshold: -85
 
+  // RSSI → distance via log-distance path-loss model:
+  //   d = 10^((txPower - rssi) / (10 * pathLoss))
+  // txPower = measured RSSI at 1 m (typical iPhone ~ -59 dBm).
+  // pathLoss = 2.0 free space, 2.5–3.5 indoor. We pick 2.5 as a sane middle.
+  readonly property int txPowerDbm: -59
+  readonly property real pathLoss: 2.5
+
+  // History for the popup chart. Trimmed on every push to keep memory bounded.
+  readonly property int historyWindowSeconds: 300
+  readonly property int historyMaxPoints: 600
+
   // ---- State machine -----------------------------------------------------
   // One of: DISARMED, ARMED, WARNING, WAITING, LOCKING, LOCKED
   property string state: "DISARMED"
@@ -53,6 +64,15 @@ Item {
   // the lower 32 bits (~664e6), giving nonsense time deltas.
   property var lastRssi: 0
   property var lastRssiAt: 0
+
+  // Rolling RSSI history for the popup chart. Each entry: {t: ms, rssi: dBm}.
+  // Only real busctl readings — never the synthetic `lastRssi = 0` we set
+  // when the phone drops, otherwise the chart would lie about presence.
+  property var rssiHistory: []
+  readonly property real distanceMeters: {
+    if (!lastRssi || lastRssi === 0) return 0
+    return Math.pow(10, (service.txPowerDbm - lastRssi) / (10 * service.pathLoss))
+  }
 
   function phoneLost() {
     var dev = service.findTargetDevice()
@@ -168,8 +188,10 @@ Item {
       onStreamFinished: {
         var n = Ble.parseBusctlRssi(text || "")
         if (n !== null && n !== 0) {
+          var now = Date.now()
           service.lastRssi = n
-          service.lastRssiAt = Date.now()
+          service.lastRssiAt = now
+          service.pushHistory(n, now)
           service.evaluateProximity()
         }
       }
@@ -200,6 +222,22 @@ Item {
     rssiProc.command = ["busctl", "get-property", "org.bluez",
                         dev.dbusPath, "org.bluez.Device1", "RSSI"]
     rssiProc.running = true
+  }
+
+  // Append a fresh RSSI sample, trim older entries outside the window.
+  // Reassigns the array (not push) so QML change notifications fire.
+  function pushHistory(rssi, t) {
+    if (!rssi || rssi === 0) return
+    var cutoff = t - service.historyWindowSeconds * 1000
+    var next = []
+    for (var i = 0; i < service.rssiHistory.length; i++) {
+      if (service.rssiHistory[i].t >= cutoff) next.push(service.rssiHistory[i])
+    }
+    next.push({ t: t, rssi: rssi })
+    if (next.length > service.historyMaxPoints) {
+      next = next.slice(next.length - service.historyMaxPoints)
+    }
+    service.rssiHistory = next
   }
 
   function stopRssiPoll() {
@@ -261,7 +299,9 @@ Item {
         var v = String(text || "").trim()
         if (v === "true") {
           service.state = "LOCKED"
-          lockCheckTimer.stop()
+          // Keep polling — we need to detect the manual unlock so the
+          // state machine returns to ARMED. Stopping here strands the
+          // service in LOCKED after every lock cycle.
         } else if (v === "false" && service.state === "LOCKED") {
           // User unlocked manually — re-arm.
           service.state = "ARMED"
@@ -406,6 +446,7 @@ Item {
       graceTimer.stop()
       idlePollTimer.stop()
       rssiPollTimer.stop()
+      lockCheckTimer.stop()
       stopRssiPoll()
       service.state = "DISARMED"
     } else {
@@ -455,9 +496,14 @@ Item {
         targetMac: service.targetMac,
         rssi: service.lastRssi,
         rssiAt: service.lastRssiAt,
+        distance: service.distanceMeters,
+        historyPoints: service.rssiHistory.length,
+        history: service.rssiHistory,
         discovering: Bluetooth.defaultAdapter ? Bluetooth.defaultAdapter.discovering : false,
         idle: service.idle,
-        threshold: service.rssiThreshold
+        threshold: service.rssiThreshold,
+        txPower: service.txPowerDbm,
+        pathLoss: service.pathLoss
       })
     }
 

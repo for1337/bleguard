@@ -26,13 +26,18 @@ Panel {
 
   readonly property var svc: root.bar && root.bar.shell ? root.bar.shell.serviceFor("leo.bleguard") : null
 
-  readonly property string state: svc ? svc.state : "DISARMED"
+  // IMPORTANT: lastRssiAt is var in Service.qml because Date.now() in 2026
+  // is ~1.79e12 ms — fits in a JS double but overflows QML's 32-bit int.
+// Convert back via Number() and * 1 to avoid auto-int coercion.
+readonly property string state: svc ? svc.state : "DISARMED"
   readonly property bool armed: svc ? svc.armed : false
   readonly property string targetMac: svc ? svc.targetMac : ""
-  readonly property int lastRssi: svc ? svc.lastRssi : 0
-  readonly property int lastRssiAt: svc ? svc.lastRssiAt : 0
+  readonly property int lastRssi: svc && svc.lastRssi !== undefined ? Number(svc.lastRssi) : 0
+  readonly property var lastRssiAt: svc && svc.lastRssiAt !== undefined ? Number(svc.lastRssiAt) : 0
+  readonly property real distance: svc && svc.distanceMeters !== undefined ? Number(svc.distanceMeters) : 0
   readonly property int threshold: svc ? svc.rssiThreshold : -85
   readonly property bool idle: svc ? svc.idle : false
+  readonly property var rssiHistory: svc ? svc.rssiHistory : []
 
   // True only when we have a *fresh* RSSI reading (polled within 15s).
   // BlueZ caches the last value in memory even after the device disappears,
@@ -318,6 +323,210 @@ Panel {
               wrapMode: Text.WordWrap
               Layout.fillWidth: true
               Layout.topMargin: Style.space(-4)
+            }
+
+            // ---- Distance box ----
+            Rectangle {
+              Layout.fillWidth: true
+              Layout.preferredHeight: Style.space(28)
+              color: Qt.darker(root.surface, 1.08)
+              radius: Style.cornerRadius
+
+              RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: Style.space(12)
+                anchors.rightMargin: Style.space(12)
+                spacing: Style.space(8)
+
+                Text {
+                  text: "Distance"
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                  Layout.preferredWidth: Style.space(60)
+                }
+                Text {
+                  text: {
+                      if (!root.rssiFresh || !root.distance) return "—"
+                      if (root.distance < 1.0)
+                        return (root.distance * 100).toFixed(0) + " cm"
+                      if (root.distance < 10)
+                        return root.distance.toFixed(2) + " m"
+                      return root.distance.toFixed(1) + " m"
+                    }
+                  color: root.distance ? root.foreground : root.dim
+                  font.family: "monospace"
+                  font.pixelSize: Style.font.bodySmall
+                  Layout.fillWidth: true
+                }
+              }
+            }
+
+            // ---- RSSI history chart ----
+            // Canvas doesn't auto-redraw on QML property updates, so we bind
+            // history/threshold to local aliases and call requestPaint() on change.
+            Rectangle {
+              id: chartFrame
+              Layout.fillWidth: true
+              Layout.preferredHeight: Style.space(120)
+              color: Qt.darker(root.surface, 1.08)
+              radius: Style.cornerRadius
+              border.color: Qt.darker(root.surface, 1.3)
+              border.width: 1
+
+              readonly property var history: root.rssiHistory
+              readonly property int thr: root.threshold
+              readonly property int rssiMin: -100
+              readonly property int rssiMax: -30
+
+              Canvas {
+                id: chart
+                anchors.fill: parent
+                anchors.margins: Style.space(6)
+                antialiasing: true
+                renderTarget: Canvas.Image
+
+                property var history: chartFrame.history
+                property int thr: chartFrame.thr
+                property int rssiMin: chartFrame.rssiMin
+                property int rssiMax: chartFrame.rssiMax
+
+                onHistoryChanged: chart.requestPaint()
+                onThrChanged: chart.requestPaint()
+                onRssiMinChanged: chart.requestPaint()
+                onRssiMaxChanged: chart.requestPaint()
+                onWidthChanged: chart.requestPaint()
+                onHeightChanged: chart.requestPaint()
+
+                // Safety net: repaint at 1 Hz in case the history signal
+                // ever stops propagating (e.g. array reassigned to itself).
+                Timer {
+                    running: chart.visible
+                    interval: 1000
+                    repeat: true
+                    onTriggered: chart.requestPaint()
+                  }
+
+                onPaint: {
+                  var ctx = getContext("2d")
+                  ctx.reset()
+
+                  // Background
+                  ctx.fillStyle = chartFrame.color
+                  ctx.fillRect(0, 0, width, height)
+
+                  var pad = 4
+                  var w = width - pad * 2
+                  var h = height - pad * 2
+                  var rssiRange = chart.rssiMax - chart.rssiMin
+
+                  function yForRssi(r) {
+                    return pad + (chart.rssiMax - r) / rssiRange * h
+                  }
+
+                  // Gridlines every 10 dBm
+                  ctx.strokeStyle = Qt.darker(chartFrame.color, 1.4)
+                  ctx.lineWidth = 1
+                  ctx.font = "9px monospace"
+                  ctx.fillStyle = root.dim
+                  ctx.textBaseline = "middle"
+                  for (var r = chart.rssiMin; r <= chart.rssiMax; r += 20) {
+                    var y = Math.round(yForRssi(r)) + 0.5
+                    ctx.beginPath()
+                    ctx.moveTo(pad, y)
+                    ctx.lineTo(width - pad, y)
+                    ctx.stroke()
+                    ctx.fillText(r, width - pad - 22, y)
+                  }
+
+                  // Threshold line
+                  var thrY = Math.round(yForRssi(chart.thr)) + 0.5
+                  ctx.strokeStyle = Qt.rgba(root.foreground.r,
+                                                   root.foreground.g,
+                                                   root.foreground.b, 0.45)
+                  ctx.setLineDash([4, 4])
+                  ctx.lineWidth = 1
+                  ctx.beginPath()
+                  ctx.moveTo(pad, thrY)
+                  ctx.lineTo(width - pad, thrY)
+                  ctx.stroke()
+                  ctx.setLineDash([])
+                  ctx.fillStyle = root.dim
+                  ctx.textAlign = "left"
+                  ctx.fillText("thr " + chart.thr, pad + 2, thrY - 6)
+
+                  if (!chart.history || chart.history.length < 2) {
+                    ctx.fillStyle = root.dim
+                    ctx.textAlign = "center"
+                    ctx.textBaseline = "middle"
+                    ctx.fillText("Collecting data…", width / 2, height / 2)
+                    return
+                  }
+
+                  // X axis: oldest at left, newest at right
+                  var h0 = chart.history
+                  var tMin = h0[0].t
+                  var tMax = h0[h0.length - 1].t
+                  var tRange = Math.max(tMax - tMin, 1)
+
+                  function xForT(t) {
+                    return pad + (t - tMin) / tRange * w
+                  }
+
+                  // Soft fill under the line
+                  ctx.fillStyle = Qt.rgba(root.foreground.r,
+                                               root.foreground.g,
+                                               root.foreground.b, 0.10)
+                  ctx.beginPath()
+                  ctx.moveTo(xForT(h0[0].t), yForRssi(h0[0].rssi))
+                  for (var i = 1; i < h0.length; i++) {
+                    ctx.lineTo(xForT(h0[i].t), yForRssi(h0[i].rssi))
+                  }
+                  ctx.lineTo(xForT(h0[h0.length - 1].t), pad + h)
+                  ctx.lineTo(xForT(h0[0].t), pad + h)
+                  ctx.closePath()
+                  ctx.fill()
+
+                  // RSSI line
+                  ctx.strokeStyle = root.foreground
+                  ctx.lineWidth = 1.5
+                  ctx.lineJoin = "round"
+                  ctx.beginPath()
+                  for (var j = 0; j < h0.length; j++) {
+                    var px = xForT(h0[j].t)
+                    var py = yForRssi(h0[j].rssi)
+                    if (j === 0) ctx.moveTo(px, py)
+                    else ctx.lineTo(px, py)
+                  }
+                  ctx.stroke()
+
+                  // Latest point dot
+                  var last = h0[h0.length - 1]
+                  ctx.fillStyle = root.foreground
+                  ctx.beginPath()
+                  ctx.arc(xForT(last.t), yForRssi(last.rssi), 2.5, 0, Math.PI * 2)
+                  ctx.fill()
+
+                  // "now" label on the right edge
+                  ctx.fillStyle = root.dim
+                  ctx.textAlign = "right"
+                  ctx.textBaseline = "bottom"
+                  ctx.font = "9px monospace"
+                  ctx.fillText("now →", width - pad - 2, height - 2)
+
+                  // Current value label next to the latest point
+                  var curLabel = last.rssi + " dBm"
+                  ctx.fillStyle = root.foreground
+                  ctx.font = "bold 10px monospace"
+                  ctx.textAlign = "right"
+                  ctx.textBaseline = "middle"
+                  var curY = yForRssi(last.rssi)
+                  // Place label slightly above or below the dot depending on space
+                  var labelY = curY > pad + h - 16 ? curY - 10 : curY + 10
+                  ctx.fillText(curLabel, width - pad - 4, labelY)
+                }
+              }
             }
 
             Rectangle {
