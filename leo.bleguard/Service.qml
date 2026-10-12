@@ -37,8 +37,12 @@ Item {
   readonly property int historyMaxPoints: 600
 
   // ---- State machine -----------------------------------------------------
-  // One of: DISARMED, ARMED, WARNING, WAITING, LOCKING, LOCKED
+  // One of: DISARMED, ARMED, WARNING, WAITING, LOCKING, LOCKED, UNLOCKING
   property string state: "DISARMED"
+  // True when this plugin triggered the lock (vs. a manual omarchy-system-lock
+  // or `omarchy shell lock lock` from a shortcut). Only auto-unlock when true —
+  // a manual lock should respect the user's intent.
+  property bool autoLockSource: false
   // Timestamps as var (not int) — see comment on lastRssiAt.
   property var phoneLostSince: 0
   property var phoneBackSince: 0
@@ -298,13 +302,19 @@ Item {
       onStreamFinished: {
         var v = String(text || "").trim()
         if (v === "true") {
-          service.state = "LOCKED"
+          if (service.state !== "LOCKED") {
+            service.state = "LOCKED"
+            // Manual external lock — not from this plugin's triggerLock().
+            service.autoLockSource = false
+          }
           // Keep polling — we need to detect the manual unlock so the
           // state machine returns to ARMED. Stopping here strands the
           // service in LOCKED after every lock cycle.
-        } else if (v === "false" && service.state === "LOCKED") {
-          // User unlocked manually — re-arm.
+        } else if (v === "false" && (service.state === "LOCKED" || service.state === "UNLOCKING")) {
+          // User unlocked (manually or via auto-unlock) — re-arm.
           service.state = "ARMED"
+          service.autoLockSource = false
+          service.phoneBackSince = 0
           service.lastRssiAt = Date.now()  // reset stale window
           lockCheckTimer.stop()
           service.evaluateProximity()
@@ -332,11 +342,30 @@ Item {
   // phone-environment flap (<5s) so a flaky link at the desk edge does not
   // spam the user.
   readonly property int lostEntryMs: 5000
+  // Stable-presence timer for auto-unlock. While LOCKED, the phone must be
+  // "in range" (connected, RSSI above threshold, fresh) for this long before
+  // we ask Omarchy's lock plugin to drop the session lock. Default 10s.
+  readonly property int unlockStableMs: 10000
 
   function evaluateProximity() {
-    if (service.state === "LOCKED" || service.state === "LOCKING") return
+    if (service.state === "LOCKING") return
     if (!service.armed) return
     if (!service.targetMac) return  // not paired yet
+
+    if (service.state === "LOCKED") {
+      // Auto-unlock path: only if this plugin triggered the lock (not a
+      // manual `omarchy-system-lock` from a keybind).
+      if (!service.autoLockSource) return
+      if (service.phoneLost()) {
+        // Phone is gone again — clear the unlock timer, stay locked.
+        service.phoneBackSince = 0
+      } else if (service.phoneBackSince === 0) {
+        service.phoneBackSince = Date.now()
+      } else if (Date.now() - service.phoneBackSince >= service.unlockStableMs) {
+        service.triggerAutoUnlock()
+      }
+      return
+    }
 
     if (service.phoneLost()) {
       // Reset the cached reading so the popup doesn't keep showing a stale
@@ -366,6 +395,26 @@ Item {
     } else {
       service.phoneBackSince = 0
     }
+  }
+
+  // ---- Auto-unlock -------------------------------------------------------
+  // Phone has been "back in range" for unlockStableMs while LOCKED — ask
+  // Omarchy's lock plugin (via IPC) to drop the session lock. Bypasses PAM:
+  // BLE proximity + stable-presence timer is the second factor.
+  // Requires the unlock IPC method in Omarchy's lock plugin
+  // (see patches/install-lock-unlock-ipc.sh).
+  function triggerAutoUnlock() {
+    if (service.state !== "LOCKED") return
+    if (!service.autoLockSource) return  // never auto-unlock a manual lock
+    service.state = "UNLOCKING"
+    service.phoneBackSince = 0
+    service.autoLockSource = false  // single-shot; the lockCheckTimer handles ARMED transition
+    Quickshell.execDetached(["bash", "-lc",
+      "qs -p /usr/share/omarchy/shell ipc call lock unlock"])
+    // The lockCheckTimer will see isLocked=false and transition us to ARMED.
+    // If the lock plugin doesn't have an `unlock` IPC method, the IPC call
+    // returns "Function not found" and we stay in UNLOCKING until the user
+    // manually unlocks — patches/install-lock-unlock-ipc.sh must be applied.
   }
 
   function enterWarning() {
@@ -398,6 +447,7 @@ Item {
     service.state = "LOCKING"
     idlePollTimer.stop()
     graceTimer.stop()
+    service.autoLockSource = true
     Quickshell.execDetached(["bash", "-lc", "omarchy-system-lock"])
     lockCheckTimer.start()
   }

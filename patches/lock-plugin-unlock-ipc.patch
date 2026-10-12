@@ -1,0 +1,26 @@
+--- a/plugins/lock/Service.qml
++++ b/plugins/lock/Service.qml
+@@ -510,6 +510,15 @@
+   IpcHandler {
+     target: "lock"
+
+     function lock(): string {
+       if (!root.passwordPamConfigured) return "missing-pam"
+       if (!root.locked && !root.beginLock()) return "failed"
+       return "ok"
+     }
+
++    // Added by leo.bleguard for BLE-proximity auto-unlock.
++    // Bypasses PAM — the caller (leo.bleguard) is responsible for proving
++    // presence via BLE proximity + a stable-presence timer. Security trade-off:
++    // a relay attacker within BLE range could trigger this. Acceptable in
++    // trusted environments, equivalent to macOS / Windows smart-unlock.
++    function unlock(): string {
++      if (!root.locked) return "not-locked"
++      root.finishUnlock()
++      return "ok"
++    }
++
+     function isLocked(): string {
+       return root.locked ? "true" : "false"
+     }
