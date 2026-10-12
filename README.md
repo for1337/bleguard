@@ -36,7 +36,7 @@ cd bleguard
 ./install.sh --enable
 ```
 
-`install.sh` symlinks `bleguard/` into `~/.config/omarchy/plugins/`, adds the plugin to `~/.config/omarchy/shell.json`, and asks Omarchy to place the bar widget in the right section. Re-run with `--force` if a previous install left a real folder at the target. `uninstall.sh` is the inverse (`--purge` also deletes the state file).
+`install.sh` copies `manifest.json`, `Panel.qml`, `Service.qml`, and `BleLogic.js` into `~/.config/omarchy/plugins/bleguard/`, adds the plugin to `~/.config/omarchy/shell.json`, and asks Omarchy to place the bar widget in the right section. Re-run with `--force` to overwrite. `uninstall.sh` is the inverse (`--purge` also deletes the state file).
 
 For the auto-unlock on return (optional):
 
