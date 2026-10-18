@@ -89,6 +89,10 @@ Item {
   // laptop can be re-armed when the user comes back with a sleeping-but-
   // broadcasting phone. The warning path also uses it via phoneLost().
   property var lastAdvAt: 0
+  // Whole output of the last `busctl get-property ... AdvertisingFlags` poll.
+  // Same string again = same cached ad = no freshness bump; different bytes =
+  // a new ad actually arrived.
+  property var lastAdvBytes: ""
   property bool advertisingEverObserved: false
 
   // Rolling RSSI history for the popup chart. Each entry: {t: ms, rssi: dBm}.
@@ -252,9 +256,9 @@ Item {
           var now = Date.now()
           if (service.lastRssi !== n) {
             service.lastRssiValueChangeAt = now
+            service.lastRssiAt = now
           }
           service.lastRssi = n
-          service.lastRssiAt = now
           service.rssiEverObserved = true
           service.pushHistory(n, now)
           service.evaluateProximity()
@@ -313,11 +317,14 @@ Item {
       waitForEnd: true
       onStreamFinished: {
         // busctl prints "ay <count> <bytes...>". Empty when no advertisement
-        // is cached: "ay 0" or "ay 0\n". Any entry with count > 0 = evidence.
+        // is cached: "ay 0" or "ay 0\n". Same string twice = BlueZ still
+        // handing back the same cached ad; treat that as no new ad and
+        // don't refresh the freshness timestamp.
         var out = String(text || "").trim()
         var m = out.match(/^ay\s+(\d+)/)
         var count = m ? parseInt(m[1], 10) : 0
-        if (count > 0) {
+        if (count > 0 && out !== service.lastAdvBytes) {
+          service.lastAdvBytes = out
           service.lastAdvAt = Date.now()
           service.advertisingEverObserved = true
           service.evaluateProximity()
