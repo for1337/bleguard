@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "bleguard",
   "name": "BLE Auto-Lock",
-  "version": "1.2.3",
+  "version": "1.2.5",
   "author": "Leonardo (for1337)",
   "description": "Auto-locks the screen when the configured phone is out of BLE range and the user is idle.",
   "kinds": [

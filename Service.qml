@@ -19,15 +19,22 @@ Item {
   readonly property int graceSeconds: 10
   readonly property int idleThresholdSeconds: 30
   readonly property int rssiStaleMs: 6000
-  // When RSSI hasn't updated for this long, we assume BlueZ stopped
-  // exposing it (paired+bonded+trusted phones may hide RSSI) and fall
-  // back to connection-only proximity.
-  readonly property int rssiStaleWindowMs: 30000
+  // How long an RSSI reading stays "fresh", i.e. how recently an
+  // advertisement must have been received for the value to be trusted.
+  // The helper's filtered-discovery session makes BlueZ republish the RSSI
+  // on *every* advertisement, so this is a real liveness window and not a
+  // "did the number move" heuristic. It has to comfortably exceed the
+  // phone's advertising interval (~15 s for an idle OPPO beacon) so a
+  // single missed advertisement does not flip the presence state.
+  readonly property int rssiStaleWindowMs: 45000
   readonly property int rssiPollMs: 2000
   readonly property int idlePollMs: 1000
   readonly property int lockCheckMs: 1000
   // Default RSSI floor. Tunable per-VM later; for now hardcoded.
   readonly property int defaultRssiThreshold: -85
+  // Default grace period between "the value crossed the threshold" and
+  // "the notification appears and the lock procedure starts".
+  readonly property int defaultLostEntryMs: 5000
 
   // RSSI → distance via log-distance path-loss model:
   //   d = 10^((txPower - rssi) / (10 * pathLoss))
@@ -50,6 +57,19 @@ Item {
   // Timestamps as var (not int) — see comment on lastRssiAt.
   property var phoneLostSince: 0
   property var phoneBackSince: 0
+
+  // ---- Auto-unlock bookkeeping -----------------------------------------
+  // Raw result of the last unlock IPC attempt ("ok", "not-locked", or an
+  // error string such as "Function not found.").
+  property string lastUnlockResult: ""
+  // Consecutive failed unlock attempts — drives the retry backoff.
+  property int unlockFailures: 0
+  // Timestamp of the last unlock IPC attempt.
+  property var lastUnlockAttemptAt: 0
+  // True between an accepted unlock request and the moment the lock
+  // plugin actually releases the session lock.
+  property bool unlockRequested: false
+  property var unlockRequestedAt: 0
 
   // ---- Live device tracking ---------------------------------------------
   // Re-resolved from Bluetooth.devices on demand — we don't hold the QObject
@@ -93,6 +113,9 @@ Item {
   // Same string again = same cached ad = no freshness bump; different bytes =
   // a new ad actually arrived.
   property var lastAdvBytes: ""
+  // True once the cached payload has been read at least once. The first
+  // reading only seeds the comparison — it is not a new advertisement.
+  property bool advBytesSeeded: false
   property bool advertisingEverObserved: false
 
   // Rolling RSSI history for the popup chart. Each entry: {t: ms, rssi: dBm}.
@@ -103,48 +126,94 @@ Item {
   // While false, phoneLost() falls back to connection-only proximity
   // (relevant for paired+trusted devices where BlueZ never exposes RSSI).
   property bool rssiEverObserved: false
+  // Where the current RSSI reading comes from: "helper" = the filtered
+  // discovery helper (a real advertisement heartbeat), "poll" = the
+  // busctl fallback, "none" = nothing yet.
+  property string rssiSource: "none"
+  // True while we have no evidence at all about the phone (right after
+  // arming). The presence decision stays neutral until the first real
+  // reading arrives, so the plugin never shouts "out of range" before it
+  // has actually listened.
+  property bool presenceWarmup: true
+  // True once the helper has an active discovery session and its
+  // PropertiesChanged subscription is live.
+  property bool helperReady: false
+  // Last error reported by the helper (empty = fine).
+  property string helperError: ""
+  // How many times the helper had to be restarted — surfaces a broken
+  // installation in the status IPC instead of failing silently.
+  property int helperRestarts: 0
   readonly property real distanceMeters: {
     if (!lastRssi || lastRssi === 0) return 0
     return Math.pow(10, (service.txPowerDbm - lastRssi) / (10 * service.pathLoss))
   }
 
-  function phoneLost() {
+  // The RSSI age in ms — 0 when nothing was ever read.
+  //
+  // A function, not a binding: a binding over Date.now() is only re-evaluated
+  // when its dependencies change, so `Date.now() - lastRssiAt` would freeze at
+  // the moment the last reading arrived and report an age of a few seconds
+  // forever. The age has to be computed where it is used.
+  function rssiAgeMs() {
+    return Ble.rssiAgeMs(service.lastRssiAt, Date.now())
+  }
+
+  // ---- Presence model ----------------------------------------------------
+  // The decision lives in BleLogic.js so it can be unit-tested from node;
+  // these two functions are thin adapters that feed it the live state.
+  function presenceOpts() {
     var dev = service.findTargetDevice()
-    var connected = dev ? dev.connected : false
-
-    // BR/EDR ACL up: trust the ACL when RSSI is stale (some phones hide
-    // RSSI while ACL is up once paired+bonded+trusted). Apply threshold
-    // when RSSI is fresh.
-    if (connected) {
-      var rssiFresh = service.rssiEverObserved
-        && lastRssiAt
-        && (Date.now() - lastRssiAt) <= service.rssiStaleWindowMs
-      if (!rssiFresh) return false
-      if (lastRssi !== 0 && lastRssi < service.rssiThreshold) return true
-      return false
+    return {
+      now: Date.now(),
+      connected: dev ? !!dev.connected : false,
+      rssi: service.lastRssi,
+      rssiAt: service.lastRssiAt,
+      rssiEverObserved: service.rssiEverObserved,
+      advAt: service.lastAdvAt,
+      advertisingEverObserved: service.advertisingEverObserved,
+      threshold: service.rssiThreshold,
+      staleWindowMs: service.rssiStaleWindowMs,
+      warmup: service.presenceWarmup
     }
+  }
 
-    // BR/EDR ACL down — some phones drop ACL during sleep while still
-    // broadcasting BLE ads. Two evidence channels:
-    //
-    //   1. Advertisements (AdvertisingFlags): the "is the phone here at
-    //      all" signal. Stale (>rssiStaleWindowMs = 30s) = gone.
-    //   2. RSSI: distance proxy. If fresh AND below threshold, phone is
-    //      at the edge of BLE range and should warn/lock regardless of
-    //      whether advertisements keep flowing.
-    //
-    // Previously the disconnected path short-circuited on advertising
-    // alone — that left a phone advertising at -65 dBm (just below the
-    // user's -64 threshold) treated as "in range" indefinitely.
-    var advFresh = service.advertisingEverObserved
-      && service.lastAdvAt
-      && (Date.now() - service.lastAdvAt) <= service.rssiStaleWindowMs
-    if (!advFresh) return true
-    var rssiFresh = service.rssiEverObserved
-      && lastRssiAt
-      && (Date.now() - lastRssiAt) <= service.rssiStaleWindowMs
-    if (rssiFresh && lastRssi !== 0 && lastRssi < service.rssiThreshold) return true
-    return false
+  // Any real observation ends the warm-up: from then on the decision is
+  // driven by the RSSI value.
+  function noteEvidence() {
+    if (service.presenceWarmup) {
+      service.presenceWarmup = false
+      warmupTimer.stop()
+    }
+  }
+
+  // Is the phone out of range? The decision is driven by the *value* of the
+  // last RSSI reading compared against the threshold:
+  //
+  //   above the threshold  → the phone is here
+  //   below the threshold  → the phone is gone
+  //
+  // A stale reading still decides, but by its last known value: it is the
+  // best evidence available, and treating "no recent advertisement" as
+  // "the phone left" made the plugin report a phone that was sitting on
+  // the desk as out of range (and froze the RSSI chart).
+  function phoneLost() {
+    return Ble.phoneLost(service.presenceOpts())
+  }
+
+  // Positive evidence that the phone is back — gates the auto-unlock.
+  // Deliberately stricter than phoneLost(): an old reading is not enough
+  // to unlock, so a phone that stays silent after the user walked away can
+  // never open the laptop on its own.
+  function phonePresent() {
+    return Ble.phonePresent(service.presenceOpts())
+  }
+
+  // Which channel currently carries the presence decision. "acl" = the
+  // BR/EDR link is up, "rssi" = a fresh advertisement-driven reading,
+  // "rssi-stale" = the last known value is old but still known,
+  // "adv" = a recent advertisement without any RSSI, "none" = nothing.
+  function presenceSource() {
+    return Ble.presenceSource(service.presenceOpts())
   }
 
   // ---- Persisted state --------------------------------------------------
@@ -154,10 +223,12 @@ Item {
     property string targetMac: ""
     property bool armed: true
     property int rssiThreshold: service.defaultRssiThreshold
+    property int lostEntryMs: service.defaultLostEntryMs
 
     onTargetMacChanged: service.saveSoon()
     onArmedChanged: service.saveSoon()
     onRssiThresholdChanged: service.saveSoon()
+    onLostEntryMsChanged: service.saveSoon()
   }
 
   readonly property alias targetMac: persisted.targetMac
@@ -171,6 +242,17 @@ Item {
     onTriggered: service.flushState()
   }
 
+  // Writes the state file (including the last known RSSI and its age)
+  // every 30 s, so a shell restart does not lose the only measurement we
+  // have about how close the phone was.
+  Timer {
+    id: persistTimer
+    interval: 30000
+    repeat: true
+    running: true
+    onTriggered: service.flushState()
+  }
+
   function saveSoon() { saveTimer.restart() }
   function flushStateNow() { saveTimer.stop(); service.flushState() }
 
@@ -178,7 +260,20 @@ Item {
     var payload = JSON.stringify({
       targetMac: persisted.targetMac,
       armed: persisted.armed,
-      rssiThreshold: persisted.rssiThreshold
+      rssiThreshold: persisted.rssiThreshold,
+      lostEntryMs: persisted.lostEntryMs,
+      // The last known reading and its age. BlueZ removes the RSSI property
+      // as soon as it stops seeing the device, so without this a shell
+      // restart would throw away the only evidence we have about how close
+      // the phone was — and the plugin would have nothing to decide with.
+      lastRssi: service.lastRssi,
+      // The absolute timestamp of the measurement. The age alone would have to
+      // be recomputed from the *current* clock on every save, and rounding it
+      // to seconds loses the sub-second precision that tells "5 s ago" from
+      // "55 s ago". The absolute stamp keeps the real age across a restart,
+      // so a restored reading is only "fresh" when it really was.
+      lastRssiAt: service.lastRssiAt,
+      lastRssiAgeSec: service.lastRssi ? Math.floor(service.rssiAgeMs() / 1000) : 0
     })
     var script =
       "import json, os\n" +
@@ -213,6 +308,20 @@ Item {
           if (typeof parsed.targetMac === "string") persisted.targetMac = parsed.targetMac
           if (typeof parsed.armed === "boolean") persisted.armed = parsed.armed
           if (typeof parsed.rssiThreshold === "number") persisted.rssiThreshold = parsed.rssiThreshold
+          if (typeof parsed.lostEntryMs === "number") persisted.lostEntryMs = parsed.lostEntryMs
+          // Restore the last known reading. The age is preserved (the state
+          // file carries the absolute timestamp of the measurement), so the
+          // reading stays as old as it really is: it can keep the phone from
+          // being reported as gone, but a stale reading can never unlock the
+          // laptop on its own. When the file carries no usable age the
+          // reading is restored as stale on purpose — an unknown age must
+          // never look fresh.
+          if (typeof parsed.lastRssi === "number" && parsed.lastRssi !== 0) {
+            service.lastRssi = parsed.lastRssi
+            service.lastRssiAt = Ble.restoreRssiAt(parsed, Date.now(), service.rssiStaleWindowMs)
+            service.rssiEverObserved = true
+            service.rssiSource = "saved"
+          }
         }
       } catch (e) {
         console.warn("bleguard: malformed state file:", e)
@@ -221,8 +330,7 @@ Item {
     service.state = service.armed ? "ARMED" : "DISARMED"
     if (service.armed && service.targetMac) {
       rssiPollTimer.start()
-      service.lastRssiAt = Date.now()  // grace window while first poll runs
-      service.lastAdvAt = Date.now()   // grace window for advertising too
+      service.startWarmup()
     }
   }
 
@@ -244,6 +352,159 @@ Item {
     if (ad) ad.discovering = !!enabled
   }
 
+  // ---- Filtered-discovery helper ----------------------------------------
+  // BlueZ only republishes a device's RSSI property when the value moves by
+  // at least 8 dBm (RSSI_THRESHOLD in device.c). A phone lying on the desk
+  // oscillates by ~10 dBm, so the exported value stays frozen at whatever
+  // was published first — the "RSSI stuck at -45 dBm while the phone is
+  // right there" symptom, and the reason the chart never moved.
+  //
+  // When the adapter runs a *filtered* discovery session, BlueZ publishes the
+  // RSSI on every received advertisement instead
+  // (device_set_rssi_with_delta(dev, rssi, 0)). That turns the property into
+  // a real heartbeat: every advertisement refreshes it even when the measured
+  // value did not move.
+  //
+  // The filter has to be installed by the same D-Bus connection that later
+  // calls StartDiscovery(), so a one-shot busctl cannot do it — a small
+  // long-lived helper does. The helper streams the values on stdout:
+  //
+  //   ready          discovery is active, subscription live
+  //   rssi <int>     the device's RSSI changed to <int> dBm
+  //   error <text>   recoverable error, the helper keeps running
+  Process {
+    id: helperProc
+    command: service.helperCommand()
+    stdout: SplitParser {
+      splitMarker: "\n"
+      onRead: function(data) {
+        service.onHelperLine(data)
+      }
+    }
+    stderr: SplitParser {
+      splitMarker: "\n"
+      onRead: function(data) {
+        var line = String(data || "").trim()
+        if (line.length > 0) console.warn("bleguard: helper: " + line)
+      }
+    }
+    onExited: function(exitCode, exitStatus) {
+      service.helperReady = false
+      if (service.armed && service.targetMac) {
+        // The helper is a long-lived session; if it dies (BlueZ restart,
+        // D-Bus reset, ...) bring it back after a short delay.
+        service.helperRestarts += 1
+        helperRestartTimer.restart()
+      }
+    }
+  }
+
+  Timer {
+    id: helperRestartTimer
+    interval: 3000
+    repeat: false
+    onTriggered: {
+      if (service.armed && service.targetMac && !helperProc.running) {
+        helperProc.command = service.helperCommand()
+        helperProc.running = true
+      }
+    }
+  }
+
+  // Bounds the warm-up: if BlueZ never tells us anything about the phone
+  // (no RSSI, no advertisement), the plugin stops waiting and falls back
+  // to the "no evidence" behaviour instead of staying silent forever.
+  Timer {
+    id: warmupTimer
+    interval: 60000
+    repeat: false
+    onTriggered: service.presenceWarmup = false
+  }
+
+  function startWarmup() {
+    service.presenceWarmup = true
+    warmupTimer.restart()
+  }
+
+  // Where the helper lives. The plugin directory is the install location;
+  // the extra candidates keep a checkout usable without reinstalling.
+  function helperPath() {
+    var home = Quickshell.env("HOME")
+    var xdg = Quickshell.env("XDG_CONFIG_HOME")
+    var bases = []
+    if (xdg) bases.push(xdg + "/omarchy/plugins/bleguard")
+    bases.push(home + "/.config/omarchy/plugins/bleguard")
+    bases.push(home + "/Projects/BLEguard/bleguard")
+    for (var i = 0; i < bases.length; i++) {
+      if (bases[i]) bases[i] = bases[i] + "/bleguard-discovery.py"
+    }
+    // The helper resolves its own location; the plugin only has to hand it
+    // the adapter and device paths. The first existing candidate wins.
+    return bases.join(" ")
+  }
+
+  function helperCommand() {
+    var dev = service.findTargetDevice()
+    var devicePath = dev && dev.dbusPath ? dev.dbusPath : ""
+    var adapterPath = ""
+    if (dev && dev.adapter && dev.adapter.dbusPath) adapterPath = dev.adapter.dbusPath
+    else if (devicePath.indexOf("/dev_") > 0) adapterPath = devicePath.substring(0, devicePath.indexOf("/dev_"))
+    if (!devicePath || !adapterPath) return ["false"]
+    return ["bash", "-c",
+      "for d in " + service.helperPath() + "; do " +
+      "  [ -f \"$d\" ] && exec python3 \"$d\" \"$@\"; " +
+      "done; " +
+      "echo 'bleguard-discovery.py not found' >&2; exit 1",
+      "bleguard-discovery", "--adapter", adapterPath, "--device", devicePath]
+  }
+
+  function onHelperLine(data) {
+    var line = String(data === undefined || data === null ? "" : data).trim()
+    if (line.length === 0) return
+    if (line === "ready") {
+      service.helperReady = true
+      service.helperError = ""
+      return
+    }
+    if (line.indexOf("rssi ") === 0) {
+      var n = parseInt(line.substring(5).trim(), 10)
+      if (isNaN(n) || n === 0) return
+      var now = Date.now()
+      if (service.lastRssi !== n) {
+        service.lastRssiValueChangeAt = now
+      }
+      // The whole point of the helper: the value is republished on every
+      // advertisement, so lastRssiAt is a genuine heartbeat even when the
+      // measured value did not move.
+      service.lastRssi = n
+      service.lastRssiAt = now
+      service.rssiEverObserved = true
+      service.rssiSource = "helper"
+      service.helperReady = true
+      service.noteEvidence()
+      service.pushHistory(n, now)
+      service.evaluateProximity()
+      return
+    }
+    if (line.indexOf("error ") === 0) {
+      service.helperError = line.substring(6).trim()
+      console.warn("bleguard: helper error: " + service.helperError)
+    }
+  }
+
+  function startHelper() {
+    if (!service.armed || !service.targetMac) return
+    if (helperProc.running) return
+    helperProc.command = service.helperCommand()
+    helperProc.running = true
+  }
+
+  function stopHelper() {
+    helperRestartTimer.stop()
+    if (helperProc.running) helperProc.running = false
+    service.helperReady = false
+  }
+
   Process {
     id: rssiProc
     command: ["busctl", "get-property", "org.bluez",
@@ -260,6 +521,11 @@ Item {
           }
           service.lastRssi = n
           service.rssiEverObserved = true
+          // The busctl poll is only a fallback: it can only see a *changed*
+          // value, so it never produces a heartbeat of its own. The helper
+          // owns the freshness of the reading when it is running.
+          if (service.rssiSource !== "helper") service.rssiSource = "poll"
+          service.noteEvidence()
           service.pushHistory(n, now)
           service.evaluateProximity()
         }
@@ -271,9 +537,7 @@ Item {
         if (msg.indexOf("No such property") >= 0 && rssiPollTimer.running) {
           // Some phones don't expose RSSI over BLE even while advertising.
           // Don't tear down the polling timer — keep evaluateProximity()
-          // running so we still check the connection state. RSSI stays 0;
-          // the rssiStaleMs timer inside phoneLost() will declare the
-          // phone "lost" after 6s if the property never reappears.
+          // running so we still check the connection state.
           console.log("bleguard: RSSI not exposed by BlueZ for " +
                       service.targetMac + " — connection-only proximity")
         }
@@ -302,6 +566,9 @@ Item {
     advProc.command = ["busctl", "get-property", "org.bluez",
                        path, "org.bluez.Device1", "AdvertisingFlags"]
     advProc.running = true
+    // The helper is the primary RSSI source: it holds the filtered
+    // discovery session open and turns the RSSI into a heartbeat.
+    service.startHelper()
   }
 
   // Tracks the AdvertisingFlags property: when BlueZ processes an
@@ -323,10 +590,25 @@ Item {
         var out = String(text || "").trim()
         var m = out.match(/^ay\s+(\d+)/)
         var count = m ? parseInt(m[1], 10) : 0
-        if (count > 0 && out !== service.lastAdvBytes) {
+        if (count === 0) {
+          // Nothing cached any more — forget the old payload so the next
+          // advertisement registers as a change even if it repeats it.
+          service.lastAdvBytes = ""
+          return
+        }
+        if (!service.advBytesSeeded) {
+          // The very first poll only tells us what BlueZ already had cached.
+          // That is not evidence that an advertisement just arrived, so it
+          // must not start the "recent advertisement" clock.
+          service.lastAdvBytes = out
+          service.advBytesSeeded = true
+          return
+        }
+        if (out !== service.lastAdvBytes) {
           service.lastAdvBytes = out
           service.lastAdvAt = Date.now()
           service.advertisingEverObserved = true
+          service.noteEvidence()
           service.evaluateProximity()
         }
       }
@@ -363,6 +645,7 @@ Item {
   function stopRssiPoll() {
     rssiProc.running = false
     advProc.running = false
+    service.stopHelper()
     setBluezDiscovery(false)
   }
 
@@ -419,7 +702,10 @@ Item {
       onStreamFinished: {
         var v = String(text || "").trim()
         if (v === "true") {
-          if (service.state !== "LOCKED") {
+          if (service.state === "UNLOCKING") {
+            // Unlock requested, lock still up — the UNLOCKING timeout in
+            // evaluateProximity() decides whether to retry.
+          } else if (service.state !== "LOCKED") {
             service.state = "LOCKED"
             // Only treat as a manual external lock if our triggerLock()
             // didn't already set autoLockSource=true. Otherwise preserve it
@@ -436,9 +722,9 @@ Item {
           // User unlocked (manually or via auto-unlock) — re-arm.
           service.state = "ARMED"
           service.autoLockSource = false
+          service.unlockRequested = false
+          service.unlockFailures = 0
           service.phoneBackSince = 0
-          service.lastRssiAt = Date.now()  // reset stale window
-          service.lastAdvAt = Date.now()   // reset advertising stale window
           lockCheckTimer.stop()
           service.evaluateProximity()
         }
@@ -461,28 +747,55 @@ Item {
   readonly property int backStableMs: 3000
   // Cumulative out-of-range time required before the WARNING notification
   // fires. Stretches across BR/EDR flaps: a 2s reconnect does not reset the
-  // counter, only a clean cancelWarning() does. Picked longer than typical
+  // counter, only a *stable* return does. Picked longer than typical
   // phone-environment flap (<5s) so a flaky link at the desk edge does not
   // spam the user.
-  readonly property int lostEntryMs: 5000
+  //
+  // This is the delay between "the value crossed the threshold" and "the
+  // notification appears and the lock procedure starts". Configurable (and
+  // persisted) through the `Grace` field in the popup or the `setGraceMs`
+  // IPC command.
+  readonly property alias lostEntryMs: persisted.lostEntryMs
   // Stable-presence timer for auto-unlock. While LOCKED, the phone must be
   // "in range" (connected, RSSI above threshold, fresh) for this long before
   // we ask Omarchy's lock plugin to drop the session lock. Default 10s.
   readonly property int unlockStableMs: 10000
+  // Backoff between unlock attempts after a failure, so a missing
+  // `unlock` IPC method doesn't hammer the shell every poll cycle.
+  readonly property int unlockRetryMs: 15000
+  // How long we wait for the lock plugin to actually release the session
+  // lock after accepting the unlock request. If it doesn't happen within
+  // this window the request is treated as ineffective and retried.
+  readonly property int unlockWaitMs: 8000
 
   function evaluateProximity() {
     if (service.state === "LOCKING") return
     if (!service.armed) return
     if (!service.targetMac) return  // not paired yet
 
+    if (service.state === "UNLOCKING") {
+      // The unlock request was accepted but the lock plugin has not
+      // released the session lock yet. If that doesn't happen within
+      // unlockWaitMs the request was ineffective — fall back to LOCKED so
+      // the presence check can try again.
+      if (service.unlockRequestedAt
+          && (Date.now() - service.unlockRequestedAt) >= service.unlockWaitMs) {
+        service.unlockRequested = false
+        service.state = "LOCKED"
+        console.warn("bleguard: unlock did not take effect, will retry")
+      }
+      return
+    }
+
     if (service.state === "LOCKED") {
       // Auto-unlock path: only if this plugin triggered the lock (not a
       // manual `omarchy-system-lock` from a keybind).
       if (!service.autoLockSource) return
-      // phoneLost() now also accepts recent BLE advertisements as
-      // presence (the sleep-but-broadcasting case), so a sleeping-but-
-      // broadcasting phone on the desk counts as "phone is back".
-      if (service.phoneLost()) {
+      // Unlocking needs *positive* evidence that the phone is back: a live
+      // ACL, a fresh advertisement or a fresh RSSI above the threshold.
+      // An old reading is not enough — otherwise a phone that stayed silent
+      // after the user walked away would keep the laptop unlocked.
+      if (!service.phonePresent()) {
         service.phoneBackSince = 0
       } else if (service.phoneBackSince === 0) {
         service.phoneBackSince = Date.now()
@@ -492,38 +805,30 @@ Item {
       return
     }
 
-    if (service.phoneLost()) {
-      // Reset the cached reading so the popup doesn't keep showing a stale
-      // value that BlueZ still has in memory but the device is actually gone.
-      service.lastRssi = 0
-      service.lastRssiAt = 0
-      // Don't reset lastAdvAt: it's owned by advProc and consumed by
-      // phoneLost(). evaluateProximity can't tell whether the disconnect
-      // is "phone genuinely gone" or "phone is sleeping but broadcasting";
-      // let the rssiStaleWindowMs (30s) keep advancing so phoneLost()
-      // eventually flips to true once advertisements stop arriving too.
-      service.phoneBackSince = 0
-      // phoneLostSince accumulates across flaps — first time we see the
-      // phone missing, stamp it; do NOT reset on brief reconnects below.
-      if (service.phoneLostSince === 0) service.phoneLostSince = Date.now()
-      if (service.state === "ARMED"
-          && Date.now() - service.phoneLostSince >= service.lostEntryMs) {
-        service.enterWarning()
-      }
-    } else if (service.state === "WARNING" || service.state === "WAITING") {
-      // Phone back — require stable for backStableMs before cancelling the
-      // warning, so a 200ms BR/EDR reconnect doesn't immediately cancel
-      // and re-arm a 10s grace timer on the next poll.
-      if (service.phoneBackSince === 0) {
-        service.phoneBackSince = Date.now()
-      } else if (Date.now() - service.phoneBackSince >= service.backStableMs) {
-        service.cancelWarning()
-      }
-      // NOTE: phoneLostSince intentionally NOT reset here — a brief
-      // reconnect (e.g. 3s) followed by another drop should be treated as
-      // continuous absence. cancelWarning() resets it on a real re-arm.
-    } else {
-      service.phoneBackSince = 0
+    // Out-of-range handling. The grace period lives in BleLogic.js so it is
+    // unit-testable from node: the notification and the whole lock procedure
+    // only start once the reading has been out of range for lostEntryMs, and
+    // a *stable* return resets the counter so the next episode starts a fresh
+    // grace period instead of firing the notification instantly.
+    //
+    // Note: the last reading is deliberately kept. It is the evidence the
+    // presence decision is based on; the popup decides on its own how to
+    // present an old value (see Panel.qml's rssiFresh), so there is no
+    // reason to throw the information away here.
+    var step = Ble.graceStep(service.state, {
+      now: Date.now(),
+      lost: service.phoneLost(),
+      lostSince: service.phoneLostSince,
+      backSince: service.phoneBackSince,
+      lostEntryMs: service.lostEntryMs,
+      backStableMs: service.backStableMs
+    })
+    service.phoneLostSince = step.lostSince
+    service.phoneBackSince = step.backSince
+    if (step.action === "enter-warning") {
+      service.enterWarning()
+    } else if (step.action === "cancel-warning") {
+      service.cancelWarning()
     }
   }
 
@@ -533,18 +838,69 @@ Item {
   // BLE proximity + stable-presence timer is the second factor.
   // Requires the unlock IPC method in Omarchy's lock plugin
   // (see patches/install-lock-unlock-ipc.sh).
+  //
+  // `qs ipc call lock unlock` prints the handler's return value on stdout
+  // and exits 0 even when the method does not exist ("Function not
+  // found."), so the stdout content is the authoritative signal — never
+  // the exit code.
+  Process {
+    id: unlockProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var out = String(text || "").trim()
+        service.lastUnlockResult = out
+        if (out === "ok" || out === "not-locked") {
+          service.unlockFailures = 0
+          service.unlockRequested = true
+          service.unlockRequestedAt = Date.now()
+          service.state = "UNLOCKING"
+          service.phoneBackSince = 0
+          // autoLockSource stays true until the lock is actually released:
+          // if the request doesn't take effect we want to be able to
+          // retry, not to strand the service in UNLOCKING forever.
+        } else {
+          service.unlockFailures += 1
+          service.unlockRequested = false
+          console.warn("bleguard: unlock IPC failed: " + out)
+          service.notifyUnlockFailure(out)
+        }
+      }
+    }
+  }
+
   function triggerAutoUnlock() {
     if (service.state !== "LOCKED") return
     if (!service.autoLockSource) return  // never auto-unlock a manual lock
-    service.state = "UNLOCKING"
-    service.phoneBackSince = 0
-    service.autoLockSource = false  // single-shot; the lockCheckTimer handles ARMED transition
-    Quickshell.execDetached(["bash", "-lc",
-      "qs -p /usr/share/omarchy/shell ipc call lock unlock"])
-    // The lockCheckTimer will see isLocked=false and transition us to ARMED.
-    // If the lock plugin doesn't have an `unlock` IPC method, the IPC call
-    // returns "Function not found" and we stay in UNLOCKING until the user
-    // manually unlocks — patches/install-lock-unlock-ipc.sh must be applied.
+    if (unlockProc.running) return
+    // Back off between failed attempts so a missing `unlock` IPC method
+    // doesn't spam the shell every poll cycle.
+    if (service.unlockFailures > 0
+        && service.lastUnlockAttemptAt
+        && (Date.now() - service.lastUnlockAttemptAt) < service.unlockRetryMs) return
+    service.lastUnlockAttemptAt = Date.now()
+    unlockProc.command = ["bash", "-lc",
+      "qs -p /usr/share/omarchy/shell ipc call lock unlock"]
+    unlockProc.running = true
+  }
+
+  // Tell the user *why* the auto-unlock didn't happen. Silently staying
+  // locked looks like a broken plugin; the most common cause is a missing
+  // IPC patch on the lock plugin, which is a one-command fix.
+  function notifyUnlockFailure(result) {
+    if (service.unlockFailures !== 1) return  // notify once per streak
+    var hint = String(result).indexOf("Function not found") >= 0
+      ? "Omarchy's lock plugin has no 'unlock' method. Install it with:\n  sudo bash patches/install-lock-unlock-ipc.sh\nthen: omarchy restart shell"
+      : "Unlock IPC failed: " + result
+    Quickshell.execDetached([
+      "omarchy-notification-send",
+      "--app-name", "bleguard",
+      "-u", "critical",
+      "-t", "15000",
+      "-i", "bluetooth-symbolic",
+      "Auto-unlock failed",
+      hint
+    ])
   }
 
   function enterWarning() {
@@ -559,8 +915,6 @@ Item {
     idlePollTimer.stop()
     service.state = "ARMED"
     service.phoneLostSince = 0
-    service.lastRssiAt = Date.now()  // reset stale window
-    service.lastAdvAt = Date.now()   // reset advertising stale window
   }
 
   function onGraceExpired() {
@@ -579,6 +933,10 @@ Item {
     idlePollTimer.stop()
     graceTimer.stop()
     service.autoLockSource = true
+    // Fresh lock cycle — clear the previous unlock bookkeeping.
+    service.unlockFailures = 0
+    service.unlockRequested = false
+    service.lastUnlockResult = ""
     Quickshell.execDetached(["bash", "-lc", "omarchy-system-lock"])
     lockCheckTimer.start()
   }
@@ -605,16 +963,26 @@ Item {
     return true
   }
 
+  // The grace period between "the reading crossed the threshold" and "the
+  // notification appears and the lock procedure starts". 0 = no delay.
+  function setGraceMs(value) {
+    var n = parseInt(value, 10)
+    if (isNaN(n)) return false
+    if (n < 0) n = 0
+    if (n > 600000) n = 600000
+    persisted.lostEntryMs = n
+    return true
+  }
+
   function setTarget(mac) {
     if (typeof mac !== "string") return false
     persisted.targetMac = mac.trim()
-    // Fresh pairing — reset the stale window so we don't immediately fire
+    // Fresh pairing — restart the warm-up so we don't immediately fire
     // a WARNING because RSSI hasn't been polled yet.
-    service.lastRssiAt = Date.now()
-    service.lastAdvAt = Date.now()
     service.state = service.armed ? "ARMED" : "DISARMED"
     if (service.armed && persisted.targetMac) {
       rssiPollTimer.start()
+      service.startWarmup()
       service.startRssiPoll()
     } else {
       stopRssiPoll()
@@ -630,17 +998,19 @@ Item {
       rssiPollTimer.stop()
       lockCheckTimer.stop()
       stopRssiPoll()
+      service.unlockFailures = 0
+      service.unlockRequested = false
+      service.lastUnlockResult = ""
       service.state = "DISARMED"
     } else {
       service.state = "ARMED"
       if (persisted.targetMac) {
         rssiPollTimer.start()
         service.startRssiPoll()
-        // Grace window while first poll runs (or fails). Without this, if
-        // BlueZ never exposes RSSI for a paired device, phoneLost() can
-        // never trigger because both rssiAt and rssi stay at 0.
-        service.lastRssiAt = Date.now()
-        service.lastAdvAt = Date.now()
+        // Warm-up while the first reading arrives. Without this, if BlueZ
+        // never exposes RSSI for a paired device, phoneLost() can
+        // immediately trigger because both rssiAt and rssi stay at 0.
+        service.startWarmup()
       }
       service.evaluateProximity()
     }
@@ -685,15 +1055,30 @@ Item {
         targetMac: service.targetMac,
         rssi: service.lastRssi,
         rssiAt: service.lastRssiAt,
+        rssiAgeMs: service.rssiAgeMs(),
         rssiValueChangeAt: service.lastRssiValueChangeAt,
+        rssiSource: service.rssiSource,
+        rssiFresh: Ble.isRssiFresh(service.presenceOpts()),
         advAt: service.lastAdvAt,
         advertisingEverObserved: service.advertisingEverObserved,
+        presence: service.presenceSource(),
+        presenceLevel: Ble.presenceLevel(service.presenceOpts()),
+        presenceWarmup: service.presenceWarmup,
+        phonePresent: service.phonePresent(),
+        helperReady: service.helperReady,
+        helperError: service.helperError,
+        helperRestarts: service.helperRestarts,
+        unlockResult: service.lastUnlockResult,
+        unlockFailures: service.unlockFailures,
+        unlockRequested: service.unlockRequested,
         distance: service.distanceMeters,
         historyPoints: service.rssiHistory.length,
         history: service.rssiHistory,
         discovering: Bluetooth.defaultAdapter ? Bluetooth.defaultAdapter.discovering : false,
         idle: service.idle,
         threshold: service.rssiThreshold,
+        lostEntryMs: service.lostEntryMs,
+        phoneLostSince: service.phoneLostSince,
         txPower: service.txPowerDbm,
         pathLoss: service.pathLoss
       })
@@ -705,6 +1090,10 @@ Item {
 
     function setThreshold(value: int): string {
       return service.setThreshold(value) ? "ok" : "invalid"
+    }
+
+    function setGraceMs(value: int): string {
+      return service.setGraceMs(value) ? "ok" : "invalid"
     }
 
     function lockNow(): string {

@@ -11,7 +11,10 @@ PLUGIN_DST="$HOME/.config/omarchy/plugins/$PLUGIN_ID"
 SHELL_JSON="$HOME/.config/omarchy/shell.json"
 
 # Files that make up the plugin (everything else in the repo is dev tooling).
-PLUGIN_FILES=(manifest.json Panel.qml Service.qml BleLogic.js)
+# bleguard-discovery.py is the filtered-discovery helper: it holds a BlueZ
+# discovery session open so the RSSI property is republished on every
+# advertisement instead of every 8 dBm of movement.
+PLUGIN_FILES=(manifest.json Panel.qml Service.qml BleLogic.js bleguard-discovery.py)
 
 enable=""
 force=""
@@ -60,6 +63,9 @@ else
   for f in "${PLUGIN_FILES[@]}"; do
     cp "$REPO_DIR/$f" "$PLUGIN_DST/$f"
   done
+  # The helper is launched through "python3 <script>", but the executable
+  # bit keeps it usable when it is called directly.
+  chmod +x "$PLUGIN_DST/bleguard-discovery.py" 2>/dev/null || true
   echo "ok: copied ${PLUGIN_FILES[*]} -> $PLUGIN_DST"
 fi
 
