@@ -26,8 +26,14 @@ Protocol (stdout, one line per event, flushed immediately)
 ----------------------------------------------------------
     ready            discovery is active and the subscription is live
     rssi <int>       the device's RSSI property changed to <int> dBm
+    rssi-cache <int> the *cached* RSSI value at startup (not a measurement)
     device <path>    the device object moved to a new D-Bus path
     error <text>     recoverable error; the helper keeps running
+
+``rssi`` is a heartbeat: it arrives on every advertisement, so the consumer
+can tell a live phone from a dead one.  ``rssi-cache`` is only the value
+BlueZ has cached from the last time it saw the device — it may be hours old
+— and must never be used as proof of life.
 
 The helper exits when it receives SIGTERM/SIGINT; on the way out it stops
 the discovery session it owns.
@@ -273,7 +279,13 @@ class Discovery:
         self._emit_current_rssi()
 
     def _emit_current_rssi(self):
-        """Push the current value once, so the consumer starts warm."""
+        """Push the cached value once, so the consumer starts warm.
+
+        This is *not* a measurement: BlueZ keeps the last value it saw, which
+        can be hours old.  It is emitted as ``rssi-cache`` so the consumer
+        knows the value but does not treat it as proof that the phone is
+        still there.
+        """
         if not self.device_path:
             return
         try:
@@ -288,7 +300,7 @@ class Discovery:
             )
             prop = proxy.get_cached_property("RSSI")
             if prop is not None:
-                emit("rssi %d" % variant_to_int(prop))
+                emit("rssi-cache %d" % variant_to_int(prop))
         except GLib.Error as exc:
             emit("error %s" % exc.message)
 

@@ -35,6 +35,14 @@ Item {
   // Default grace period between "the value crossed the threshold" and
   // "the notification appears and the lock procedure starts".
   readonly property int defaultLostEntryMs: 5000
+  // Default window of complete silence (no ACL, no advertisement, no RSSI)
+  // after which the phone counts as out of range, exactly like a measurement
+  // below the threshold. A phone that switched its radio off cannot send us
+  // a weak signal — it simply stops answering, and that silence is the only
+  // evidence left. The window has to be long enough to survive a gap
+  // between two advertisements and a BR/EDR drop, but short enough that a
+  // radio that stays off is noticed.
+  readonly property int defaultAbsentAfterMs: 45000
 
   // RSSI → distance via log-distance path-loss model:
   //   d = 10^((txPower - rssi) / (10 * pathLoss))
@@ -57,6 +65,11 @@ Item {
   // Timestamps as var (not int) — see comment on lastRssiAt.
   property var phoneLostSince: 0
   property var phoneBackSince: 0
+  // When we started waiting for the phone. Used as the fallback start of the
+  // silence clock when the phone was never heard from at all (armed while the
+  // radio was off): without it there would be no reference point to measure
+  // the silence against.
+  property var presenceSince: 0
 
   // ---- Auto-unlock bookkeeping -----------------------------------------
   // Raw result of the last unlock IPC attempt ("ok", "not-locked", or an
@@ -100,6 +113,17 @@ Item {
   // genuinely stays at one value, and we'd rather not flag a real "still
   // here" as stale.
   property var lastRssiValueChangeAt: 0
+  // Baseline for the busctl fallback: the value the poll saw last time.
+  // BlueZ's RSSI property is a *cache* — it is rewritten only when BlueZ
+  // actually heard the device — so a value that does not change between two
+  // polls proves nothing about the phone. Only a change is proof of life.
+  // The first poll after a restart only seeds this baseline: the value it
+  // returns may be hours old.
+  property var lastPollRssi: 0
+  // The device path the poll baseline belongs to. A different device (a
+  // re-pair) invalidates the baseline: its value says nothing about the new
+  // device.
+  property string pollPath: ""
 
   // "Phone is advertising" evidence. BlueZ populates AdvertisingFlags /
   // ManufacturerData when an advertisement is processed while Discovering=true,
@@ -158,6 +182,13 @@ Item {
     return Ble.rssiAgeMs(service.lastRssiAt, Date.now())
   }
 
+  // How long we have heard nothing from the phone: the age of the most
+  // recent piece of evidence (an RSSI reading or an advertisement), or the
+  // time since we started waiting when there never was any.
+  function silenceAgeMs() {
+    return Ble.silenceAgeMs(service.presenceOpts())
+  }
+
   // ---- Presence model ----------------------------------------------------
   // The decision lives in BleLogic.js so it can be unit-tested from node;
   // these two functions are thin adapters that feed it the live state.
@@ -173,6 +204,8 @@ Item {
       advertisingEverObserved: service.advertisingEverObserved,
       threshold: service.rssiThreshold,
       staleWindowMs: service.rssiStaleWindowMs,
+      absentAfterMs: service.absentAfterMs,
+      since: service.presenceSince,
       warmup: service.presenceWarmup
     }
   }
@@ -186,16 +219,20 @@ Item {
     }
   }
 
-  // Is the phone out of range? The decision is driven by the *value* of the
-  // last RSSI reading compared against the threshold:
+  // Is the phone out of range? Two ways to be out of range:
   //
-  //   above the threshold  → the phone is here
-  //   below the threshold  → the phone is gone
+  //   1. the last RSSI value is below the threshold
+  //   2. the phone stopped answering altogether — no ACL, no advertisement, no
+  //      reading — for longer than the absence window
   //
-  // A stale reading still decides, but by its last known value: it is the
-  // best evidence available, and treating "no recent advertisement" as
-  // "the phone left" made the plugin report a phone that was sitting on
-  // the desk as out of range (and froze the RSSI chart).
+  // While the silence is still shorter than the absence window the last known
+  // value decides, so a single missed advertisement changes nothing. Once the
+  // silence outlasts the window the phone counts as gone: a radio that has
+  // been switched off (or a phone that walked out of range) must still
+  // trigger the lock.
+  //
+  // The ACL is the safety gate: while the BR/EDR link is up the phone is
+  // proven to be here, so a quiet BLE beacon never counts as absence.
   function phoneLost() {
     return Ble.phoneLost(service.presenceOpts())
   }
@@ -224,16 +261,19 @@ Item {
     property bool armed: true
     property int rssiThreshold: service.defaultRssiThreshold
     property int lostEntryMs: service.defaultLostEntryMs
+    property int absentAfterMs: service.defaultAbsentAfterMs
 
     onTargetMacChanged: service.saveSoon()
     onArmedChanged: service.saveSoon()
     onRssiThresholdChanged: service.saveSoon()
     onLostEntryMsChanged: service.saveSoon()
+    onAbsentAfterMsChanged: service.saveSoon()
   }
 
   readonly property alias targetMac: persisted.targetMac
   readonly property alias armed: persisted.armed
   readonly property alias rssiThreshold: persisted.rssiThreshold
+  readonly property alias absentAfterMs: persisted.absentAfterMs
 
   Timer {
     id: saveTimer
@@ -262,6 +302,7 @@ Item {
       armed: persisted.armed,
       rssiThreshold: persisted.rssiThreshold,
       lostEntryMs: persisted.lostEntryMs,
+      absentAfterMs: persisted.absentAfterMs,
       // The last known reading and its age. BlueZ removes the RSSI property
       // as soon as it stops seeing the device, so without this a shell
       // restart would throw away the only evidence we have about how close
@@ -309,6 +350,7 @@ Item {
           if (typeof parsed.armed === "boolean") persisted.armed = parsed.armed
           if (typeof parsed.rssiThreshold === "number") persisted.rssiThreshold = parsed.rssiThreshold
           if (typeof parsed.lostEntryMs === "number") persisted.lostEntryMs = parsed.lostEntryMs
+          if (typeof parsed.absentAfterMs === "number") persisted.absentAfterMs = parsed.absentAfterMs
           // Restore the last known reading. The age is preserved (the state
           // file carries the absolute timestamp of the measurement), so the
           // reading stays as old as it really is: it can keep the phone from
@@ -423,24 +465,42 @@ Item {
 
   function startWarmup() {
     service.presenceWarmup = true
+    // The silence clock starts now: if the phone never answers at all, this
+    // is the moment we measure the silence against.
+    service.presenceSince = Date.now()
     warmupTimer.restart()
   }
 
-  // Where the helper lives. The plugin directory is the install location;
-  // the extra candidates keep a checkout usable without reinstalling.
+  // Where the helper lives. The helper always ships next to this very file,
+  // so the directory of the running QML is the primary candidate; the
+  // explicit paths below keep a checkout usable without reinstalling and
+  // survive a non-file URL (qrc, remote loader, ...).
   function helperPath() {
     var home = Quickshell.env("HOME")
     var xdg = Quickshell.env("XDG_CONFIG_HOME")
     var bases = []
+
+    var selfDir = String(Qt.resolvedUrl("."))
+    if (selfDir.indexOf("file://") === 0) selfDir = selfDir.substring(7)
+    if (selfDir.length > 0 && selfDir.charAt(selfDir.length - 1) === "/")
+      selfDir = selfDir.substring(0, selfDir.length - 1)
+    if (selfDir) bases.push(selfDir)
+
     if (xdg) bases.push(xdg + "/omarchy/plugins/bleguard")
     bases.push(home + "/.config/omarchy/plugins/bleguard")
-    bases.push(home + "/Projects/BLEguard/bleguard")
+
+    var paths = []
     for (var i = 0; i < bases.length; i++) {
-      if (bases[i]) bases[i] = bases[i] + "/bleguard-discovery.py"
+      if (!bases[i]) continue
+      var p = bases[i] + "/bleguard-discovery.py"
+      // The candidates are handed to a shell loop: a single quote would
+      // break the quoting, so such a path is dropped instead of mangled.
+      if (p.indexOf("'") >= 0) continue
+      paths.push("'" + p + "'")
     }
     // The helper resolves its own location; the plugin only has to hand it
     // the adapter and device paths. The first existing candidate wins.
-    return bases.join(" ")
+    return paths.join(" ")
   }
 
   function helperCommand() {
@@ -464,6 +524,20 @@ Item {
     if (line === "ready") {
       service.helperReady = true
       service.helperError = ""
+      return
+    }
+    if (line.indexOf("rssi-cache ") === 0) {
+      // The value BlueZ has cached from the last time it saw the device. It
+      // may be hours old: it is a value, not proof of life. Recording it
+      // without touching lastRssiAt keeps the age honest — otherwise a
+      // restart would make a dead phone look fresh and alive.
+      var cached = parseInt(line.substring(11).trim(), 10)
+      if (isNaN(cached) || cached === 0) return
+      if (service.lastRssi !== cached) {
+        service.lastRssiValueChangeAt = Date.now()
+        service.lastRssi = cached
+        service.rssiEverObserved = true
+      }
       return
     }
     if (line.indexOf("rssi ") === 0) {
@@ -513,22 +587,34 @@ Item {
       waitForEnd: true
       onStreamFinished: {
         var n = Ble.parseBusctlRssi(text || "")
-        if (n !== null && n !== 0) {
-          var now = Date.now()
-          if (service.lastRssi !== n) {
-            service.lastRssiValueChangeAt = now
-            service.lastRssiAt = now
-          }
-          service.lastRssi = n
-          service.rssiEverObserved = true
-          // The busctl poll is only a fallback: it can only see a *changed*
-          // value, so it never produces a heartbeat of its own. The helper
-          // owns the freshness of the reading when it is running.
-          if (service.rssiSource !== "helper") service.rssiSource = "poll"
+        if (n === null || n === 0) return
+        var now = Date.now()
+        // The busctl poll is a fallback: it reads BlueZ's *cached* RSSI, and
+        // BlueZ only rewrites that property when it actually heard the
+        // device. So:
+        //   - the very first poll only tells us what BlueZ already had
+        //     cached (possibly hours old): a value, not proof of life;
+        //   - a value identical to the previous poll tells us nothing new.
+        // Only a change against the previous poll proves the phone was
+        // heard in between — and that is what refreshes the freshness clock
+        // and closes the warm-up. The helper owns the heartbeat while it
+        // runs; this poll only covers the devices BlueZ hides from it.
+        var measured = Ble.pollProvesLife(service.lastPollRssi, n)
+        if (service.lastRssi !== n) {
+          service.lastRssiValueChangeAt = now
+        }
+        if (measured) {
+          service.lastRssiAt = now
+        }
+        service.lastPollRssi = n
+        service.lastRssi = n
+        service.rssiEverObserved = true
+        if (service.rssiSource !== "helper") service.rssiSource = "poll"
+        if (measured) {
           service.noteEvidence()
           service.pushHistory(n, now)
-          service.evaluateProximity()
         }
+        service.evaluateProximity()
       }
     }
     onExited: function(exitCode) {
@@ -555,6 +641,12 @@ Item {
       return
     }
     var path = dev.dbusPath
+    // A different device invalidates the poll baseline: the cached value of
+    // the previous phone says nothing about this one.
+    if (service.pollPath !== path) {
+      service.pollPath = path
+      service.lastPollRssi = 0
+    }
     // Poll RSSI regardless of ACL state. Some phones expose RSSI even
     // while BR/EDR is asleep (it stays in BlueZ's advertising cache),
     // and on others a "No such property" response just leaves the timer
@@ -974,6 +1066,18 @@ Item {
     return true
   }
 
+  // How long the phone has to stay completely silent (no ACL, no
+  // advertisement, no reading) before it counts as out of range.
+  // 0 = the first missing heartbeat is enough.
+  function setAbsentAfterMs(value) {
+    var n = parseInt(value, 10)
+    if (isNaN(n)) return false
+    if (n < 0) n = 0
+    if (n > 3600000) n = 3600000
+    persisted.absentAfterMs = n
+    return true
+  }
+
   function setTarget(mac) {
     if (typeof mac !== "string") return false
     persisted.targetMac = mac.trim()
@@ -1078,6 +1182,8 @@ Item {
         idle: service.idle,
         threshold: service.rssiThreshold,
         lostEntryMs: service.lostEntryMs,
+        absentAfterMs: service.absentAfterMs,
+        silenceAgeMs: Ble.silenceAgeMs(service.presenceOpts()),
         phoneLostSince: service.phoneLostSince,
         txPower: service.txPowerDbm,
         pathLoss: service.pathLoss
@@ -1094,6 +1200,10 @@ Item {
 
     function setGraceMs(value: int): string {
       return service.setGraceMs(value) ? "ok" : "invalid"
+    }
+
+    function setAbsentAfterMs(value: int): string {
+      return service.setAbsentAfterMs(value) ? "ok" : "invalid"
     }
 
     function lockNow(): string {

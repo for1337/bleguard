@@ -91,22 +91,93 @@ function restoreRssiAt(saved, now, staleWindowMs) {
     return now - window_ - 1
 }
 
+// Is a recent advertisement fresh?
+//
+// The advertisement *cache* (AdvertisingData, ServiceData, …) is a snapshot of
+// the last advertisement BlueZ processed, so it proves nothing on its own.
+// What matters is when that advertisement arrived: that is the liveness
+// signal the helper hands us.
+function isAdvFresh(opts) {
+    var staleWindow = opts.staleWindowMs === undefined ? 45000 : opts.staleWindowMs
+    return !!opts.advertisingEverObserved
+        && !!opts.advAt
+        && (opts.now - opts.advAt) <= staleWindow
+}
+
+// How long have we heard nothing from the phone?
+//
+// Returns the age of the most recent piece of evidence — an RSSI reading or
+// an advertisement — or null when the phone was never heard at all.
+// `opts.since` is the fallback for that case: the moment we started waiting
+// for the phone.
+function silenceAgeMs(opts) {
+    var now = opts.now === undefined ? Date.now() : opts.now
+    var last = 0
+    if (opts.rssiAt) last = opts.rssiAt
+    if (opts.advAt && opts.advAt > last) last = opts.advAt
+    if (!last && opts.since) last = opts.since
+    if (!last) return null
+    var age = now - last
+    return age > 0 ? age : 0
+}
+
+// Has the phone stopped answering altogether?
+//
+// A phone that switched its radio off, walked out of range for good or simply
+// died looks exactly the same from here: no ACL, no advertisement, no RSSI.
+// That silence is treated like a measurement below the threshold — the phone
+// is out of range.
+//
+// The gate that keeps the "phone lying on the desk" case safe is the ACL: a
+// live BR/EDR link is proof of presence on its own, so a quiet BLE beacon
+// never counts as absence while the link is up.
+//
+// opts.absentAfterMs  how long the silence has to last (default 45000)
+function absentBySilence(opts) {
+    if (opts.connected) return false
+    if (isRssiFresh(opts)) return false
+    if (isAdvFresh(opts)) return false
+    var age = silenceAgeMs(opts)
+    if (age === null) return false
+    var limit = opts.absentAfterMs === undefined ? 45000 : opts.absentAfterMs
+    return age >= limit
+}
+
+// Does a polled RSSI reading prove that the phone is alive?
+//
+// The busctl fallback reads BlueZ's *cached* RSSI property, and BlueZ only
+// rewrites that property when it actually heard the device. So:
+//
+//   - the very first poll only reveals what BlueZ already had cached, which
+//     may be hours old: a value, not proof of life;
+//   - a value identical to the previous poll tells us nothing new.
+//
+// Only a change against the previous poll proves the phone was heard in
+// between. This is the same "seed the baseline, then compare" rule the
+// advertisement path uses.
+//
+// previous  the value the previous poll returned (0 = no baseline yet)
+// current   the value this poll returned (0 = nothing usable)
+function pollProvesLife(previous, current) {
+    if (!current || current === 0) return false
+    if (!previous || previous === 0) return false
+    return previous !== current
+}
+
 // Which channel currently carries the presence decision.
 //
 //   "acl"         BR/EDR ACL is up — the link itself is the proof
 //   "rssi"        a fresh RSSI reading (an advertisement arrived recently)
+//   "absent"      no proof at all for longer than the absence window
 //   "rssi-stale"  the last RSSI is old, but we still know its value
 //   "adv"         no RSSI ever, but a recent advertisement was observed
 //   "unknown"     nothing recent at all
 function presenceLevel(opts) {
-    var staleWindow = opts.staleWindowMs === undefined ? 45000 : opts.staleWindowMs
     if (opts.connected) return "acl"
     if (isRssiFresh(opts)) return "rssi"
+    if (absentBySilence(opts)) return "absent"
     if (opts.rssiEverObserved && opts.rssi !== 0 && opts.rssi !== undefined) return "rssi-stale"
-    var advFresh = !!opts.advertisingEverObserved
-        && !!opts.advAt
-        && (opts.now - opts.advAt) <= staleWindow
-    if (advFresh) return "adv"
+    if (isAdvFresh(opts)) return "adv"
     return "unknown"
 }
 
@@ -121,19 +192,21 @@ function presenceSource(opts) {
 // Decide whether the phone is "out of range". Mirrors Service.qml's
 // phoneLost() so the same logic is unit-testable from node.
 //
-// The rule: **the RSSI value decides**, whether it is fresh or stale.
-// Silence is never evidence of absence.
+// Two ways to be out of range:
 //
-//   value >= threshold → the phone is here
-//   value <  threshold → the phone is out of range
-//   no value at all   → we know nothing → hold the current state
+//   1. the RSSI value is below the threshold
+//   2. the phone stopped answering altogether — no ACL, no advertisement, no
+//      reading — for longer than the absence window
 //
-// Why that last line is not a cop-out: BlueZ *removes* the RSSI property
-// from the device object as soon as it stops seeing the device, and this
-// phone's beacon advertises in bursts with tens of minutes of silence in
-// between. Treating "the property is gone" as "the phone left" is what
-// made the plugin lock the laptop (and shout "Phone out of range") while
-// the phone was lying on the desk.
+// While the silence is still shorter than the absence window the last known
+// *value* decides, so a single missed advertisement never changes anything.
+// Once the silence outlasts the window the phone counts as gone: a radio
+// that has been switched off (or a phone that walked out of range) must
+// still trigger the lock.
+//
+// The ACL is what keeps the "phone lying on the desk" case safe: a live
+// BR/EDR link is proof of presence on its own, so a quiet BLE beacon never
+// counts as absence while the link is up.
 //
 // opts:
 //   now              current timestamp in ms
@@ -143,8 +216,11 @@ function presenceSource(opts) {
 //   rssiEverObserved BlueZ returned at least one real reading
 //   advAt            timestamp of the last *new* advertisement (0 = never)
 //   advertisingEverObserved  BlueZ returned at least one advertisement
+//   since            when we started waiting for the phone (no evidence yet)
 //   threshold        RSSI threshold in dBm
 //   staleWindowMs    how long a reading stays "fresh" (default 45000)
+//   absentAfterMs    how long the silence must last to count as absence
+//                    (default 45000)
 //   warmup           true while we have no evidence yet (never alarm)
 function phoneLost(opts) {
     var threshold = opts.threshold
@@ -162,15 +238,18 @@ function phoneLost(opts) {
         return false
     }
 
-    // The value decides — fresh or stale. A phone last seen close is never
-    // reported as gone just because its beacon went quiet.
+    // The phone went quiet for longer than the absence window: treat it like
+    // a measurement below the threshold.
+    if (absentBySilence(opts)) return true
+
+    // The value decides — fresh or stale, while the silence is still short
+    // enough to be a gap between two advertisements.
     if (opts.rssiEverObserved && opts.rssi !== 0 && opts.rssi !== undefined) {
         return opts.rssi < threshold
     }
 
-    // No RSSI at all: there is no measurement to judge, and the silence of
-    // the advertisement channel does not prove anything either (the beacon
-    // has a burst duty cycle). Hold the current state instead of guessing.
+    // No RSSI at all: there is no measurement to judge. The absence window
+    // (checked above) decides whether the silence is already too long.
     return false
 }
 
@@ -185,11 +264,7 @@ function phonePresent(opts) {
     if (isRssiFresh(opts)) {
         return opts.rssi !== 0 && opts.rssi >= opts.threshold
     }
-    var staleWindow = opts.staleWindowMs === undefined ? 45000 : opts.staleWindowMs
-    var advFresh = !!opts.advertisingEverObserved
-        && !!opts.advAt
-        && (opts.now - opts.advAt) <= staleWindow
-    return advFresh
+    return isAdvFresh(opts)
 }
 
 // The out-of-range grace period.
@@ -276,6 +351,10 @@ if (typeof module !== "undefined" && module.exports) {
         restoreRssiAt: restoreRssiAt,
         presenceLevel: presenceLevel,
         presenceSource: presenceSource,
+        isAdvFresh: isAdvFresh,
+        silenceAgeMs: silenceAgeMs,
+        absentBySilence: absentBySilence,
+        pollProvesLife: pollProvesLife,
         phoneLost: phoneLost,
         phonePresent: phonePresent,
         graceStep: graceStep,

@@ -10,6 +10,7 @@ The plugin watches the BLE link to the phone you picked in the popup and compare
 
 - **value ≥ threshold** → the phone is close → stay unlocked
 - **value < threshold** → the phone is out of range → the value has to **stay** below the threshold for the grace period (default 5 s) before anything happens; only then the "Phone out of range" notification appears, and after a further 10 s grace period and 30 s of idleness the screen locks via `omarchy-system-lock`
+- **no signal at all** → the phone stopped answering → after the absence window (default 45 s) this counts as out of range too, with the same grace period, the same notification and the same lock
 
 That is the same rule the chart in the popup draws, so the graph and the state can never contradict each other. The threshold is a plain dBm number (default −85, range −100..−30): *above the dashed line = close = unlocked, below it = out of range*.
 
@@ -28,21 +29,26 @@ The `busctl` poll every 2 s is kept as a fallback for when the helper cannot run
 
 ### How a stale reading is treated
 
-A phone does not advertise continuously — an idle beacon can stay silent for tens of minutes. On top of that, **BlueZ removes the `RSSI` property from the device object as soon as it stops seeing the device**, so during a silence there is no value at all. The plugin therefore never turns silence into "the phone is gone":
+A phone does not advertise continuously — an idle beacon can stay silent for tens of minutes. On top of that, **BlueZ removes the `RSSI` property from the device object as soon as it stops seeing the device**, so during a silence there is no value at all. The plugin therefore decides on the **value** while the value is fresh, and on the **silence** once the silence outlasts the absence window:
 
 | situation | decision |
 | --- | --- |
 | fresh reading (advertisement within `rssiStaleWindowMs`, 45 s) | the value decides |
-| stale reading | the **last known value** decides; a phone last seen close is never reported as lost |
-| no reading ever | **no decision**: the state is held. Silence is not evidence of absence |
+| stale reading, silence shorter than `absentAfterMs` | the **last known value** decides; a phone last seen close is not reported as lost yet |
+| no proof at all for longer than `absentAfterMs` (default 45 s) | **out of range**: the phone stopped answering, which is what a radio that has been switched off looks like from here |
+| no reading ever and no reference point | **no decision**: the state is held. There is nothing to measure the silence against |
+
+**The silence is the absence.** A phone that switches its radio off cannot send us a weak signal — it simply stops answering, and that silence is the only evidence left. So after `absentAfterMs` of complete silence (no BR/EDR link, no advertisement, no reading) the plugin treats the phone exactly like a measurement below the threshold: the grace period runs, the "Phone out of range" notification appears, and the screen locks. Tune the window in the popup (`Silence (s)`, default 45, range 0..600) or with `omarchy-shell bleguard.ctrl setAbsentAfterMs <ms>`; `0` means the first missing heartbeat is enough.
+
+**The ACL is the safety gate.** While the BR/EDR link is up, the phone is proven to be there — the link itself is the evidence — so a quiet BLE beacon never counts as absence and a phone lying on the desk is never reported as lost. The absence only fires when the link is down *and* nothing else arrives. The residual risk is a phone that drops BR/EDR *and* stops advertising at the same time (a deep sleep, or the radio really off): then the laptop locks even though the phone is in your pocket, and because unlocking needs fresh proof you type the password once. Raise `Silence (s)` if you see that.
 
 The last known value is persisted in `~/.local/state/omarchy/bleguard-state.json`, together with the **absolute timestamp** of the measurement, so a shell restart does not throw away the only measurement available — the plugin resumes with the same evidence it had before. The timestamp is stored absolute (not as an age) so the age cannot drift or be rounded away: a reading restored from disk is only "fresh" when it really was measured a few seconds ago. If the file carries no usable timestamp the reading is restored as stale on purpose — an unknown age must never look fresh.
 
-The consequence is deliberate: if the beacon goes silent *and* the last measurement said "close", the laptop stays unlocked. The plugin will only lock once it actually measures a value below the threshold (the phone in the next room), and it will only unlock on **fresh** proof that the phone is back (a live BR/EDR link, a recent advertisement, or a recent RSSI at or above the threshold). A stale value can keep the laptop unlocked but can never open it on its own.
+The consequence is deliberate: the *value* keeps the laptop unlocked while it is fresh, and the *silence* locks it once the phone stops answering for good. Unlocking always needs **fresh** proof that the phone is back (a live BR/EDR link, a recent advertisement, or a recent RSSI at or above the threshold): a stale value can keep the laptop unlocked but can never open it on its own.
 
 If you become idle while the phone is "lost", the screen locks via `omarchy-system-lock`. If the phone comes back with `autoLockSource=true` (only locks this plugin triggered), the plugin drops the session lock without PAM after `unlockStableMs` (10 s) of stable presence.
 
-State machine: `DISARMED → ARMED → WARNING → WAITING → LOCKING → LOCKED → UNLOCKING → ARMED`. Manual unlock routes `LOCKED → ARMED` directly; auto-unlock routes through `UNLOCKING`. State (target MAC, armed flag, threshold) persists in `~/.local/state/omarchy/bleguard-state.json` so it survives shell restarts.
+State machine: `DISARMED → ARMED → WARNING → WAITING → LOCKING → LOCKED → UNLOCKING → ARMED`. Manual unlock routes `LOCKED → ARMED` directly; auto-unlock routes through `UNLOCKING`. State (target MAC, armed flag, threshold, grace period, absence window) persists in `~/.local/state/omarchy/bleguard-state.json` so it survives shell restarts.
 
 ## requirements
 
@@ -93,10 +99,11 @@ Click the bar widget — first launch shows the device picker (only currently-pa
 
 - an `armed` toggle
 - current RSSI value and a signal-bar indicator (a stale value is shown greyed out and marked `old`, never hidden)
-- a `Presence` row that spells out the decision: the channel that carries it (`connected`, `rssi`, `rssi-stale`), the comparison (`-45 dBm ≥ thr -85 → in range`) and whether the value is live or the last known one
-- a rolling RSSI chart (last 5 minutes) with the threshold line drawn in and the rule written next to it (`thr -85 · below = out of range`); when the phone goes quiet the chart **breaks the line** and marks the last point as `old` instead of drawing a frozen curve
+- a `Presence` row that spells out the decision: the channel that carries it (`connected`, `rssi`, `rssi-stale`, `absent`), the comparison (`-45 dBm ≥ thr -85 → in range`) and whether the value is live or the last known one
+- a **scrolling** RSSI chart: the x axis is pinned to a fixed window (the last 2 minutes) and the curve really scrolls to the left as time passes, so only the recent period is on screen and the old readings are dropped instead of squeezing the whole history into the frame. The window length is written under the axis (`last 2 min`) and `now` marks the right edge; the threshold line is drawn in with the rule written next to it (`thr -85 · below = out of range`); when the phone goes quiet the chart **breaks the line** and marks the last point as `old` instead of drawing a frozen curve. With no reading inside the window the last known level is shown as a dashed line, so an empty frame never means "no data"
 - a `Threshold (dBm)` field (default −85, range −100..−30) that becomes the new lock boundary the moment you change it
 - a `Grace (s)` field (default 5, range 0..300) — the delay between the value crossing the threshold and the "Phone out of range" notification appearing
+- a `Silence (s)` field (default 45, range 0..600) — how long the phone has to stop answering altogether before the silence itself counts as "out of range"
 - a `Lock now` button for testing
 
 Hand-edit the state file and `omarchy restart shell` — the service hydrates from disk on startup.
@@ -111,13 +118,14 @@ omarchy-shell bleguard.ctrl lockNow
 omarchy-shell bleguard.ctrl setTarget <MAC>          # programmatic pairing
 omarchy-shell bleguard.ctrl setThreshold <dBm>       # e.g. -75
 omarchy-shell bleguard.ctrl setGraceMs <ms>         # e.g. 15000
+omarchy-shell bleguard.ctrl setAbsentAfterMs <ms>   # e.g. 300000
 ```
 
 The `status` JSON exposes the fields that explain *why* the plugin behaves the way it does:
 
 | field | meaning |
 | --- | --- |
-| `presence` / `presenceLevel` | which channel currently carries the decision: `acl` (BR/EDR link up), `rssi` (a fresh reading), `rssi-stale` (the last known value, still used), `adv` (advertisement only), `none` (nothing at all) |
+| `presence` / `presenceLevel` | which channel currently carries the decision: `acl` (BR/EDR link up), `rssi` (a fresh reading), `rssi-stale` (the last known value, still used), `absent` (no proof at all for longer than the absence window), `adv` (advertisement only), `none` (nothing at all) |
 | `presenceWarmup` | true while the plugin has no evidence yet — it never alarms in that window |
 | `rssi` / `rssiAt` / `rssiAgeMs` | the last reading, when it arrived, how old it is |
 | `rssiFresh` | true when the reading is recent enough to be a heartbeat |
@@ -129,6 +137,8 @@ The `status` JSON exposes the fields that explain *why* the plugin behaves the w
 | `advAt` | when the advertisement payload last changed |
 | `lostEntryMs` | the grace period in ms — how long the reading has to stay out of range before the warning fires |
 | `phoneLostSince` | when the reading went out of range (0 = not out of range); the warning fires `lostEntryMs` after this |
+| `absentAfterMs` | the absence window in ms — how long the phone has to stay completely silent before the silence counts as out of range |
+| `silenceAgeMs` | how long we have actually heard nothing from the phone |
 
 Note: `omarchy-shell bleguard status` (without `.ctrl`) is the Omarchy base Panel handler (`show`/`hide`/`toggle`) — `status` lives on the `.ctrl` target.
 
@@ -136,8 +146,9 @@ Note: `omarchy-shell bleguard status` (without `.ctrl`) is the Omarchy base Pane
 
 - **BlueZ republishes `RSSI` only every 8 dBm.** `device.c` defines `RSSI_THRESHOLD 8`, so a phone sitting on the desk left the exported value frozen at −45 dBm and the chart stuck. The filtered-discovery helper fixes this: in a filtered session BlueZ calls `device_set_rssi_with_delta(dev, rssi, 0)` and republishes on every advertisement. The filter has to be installed by the *same* D-Bus connection that later calls `StartDiscovery` — `SetDiscoveryFilter` only pre-sets a filter for its own caller — which is why a one-shot `busctl` cannot do it.
 - **The filter must stay permissive.** The helper uses `RSSI = -127` and no UUID restriction, so a phone walking out of range is still reported with its fading signal instead of being filtered out of the session entirely.
-- **A phone advertises in bursts.** Measured on an OPPO Find X9 Pro: roughly one advertisement every 15 s, but in blocks — 14 minutes of traffic, then ~32 minutes of silence, then ~37 minutes again. During a silence there is *no* signal at all (BlueZ even removes the `RSSI` property), so the plugin holds its state: it neither locks nor unlocks. This is the price of never guessing: the laptop stays as it was until the beacon speaks again. If you walk away while the beacon is muted, the automatic lock cannot fire; if you come back while it is muted, the automatic unlock cannot fire either and you type your password.
+- **A phone advertises in bursts.** Measured on an OPPO Find X9 Pro: roughly one advertisement every 15 s, but in blocks — 14 minutes of traffic, then ~32 minutes of silence, then ~37 minutes again. During a silence there is *no* signal at all (BlueZ even removes the `RSSI` property). The BR/EDR link is what saves the day: as long as it is up, the phone is proven to be there and the silence changes nothing. If the link drops as well (the phone really switched its radio off, or it is deep asleep), the silence lasts longer than the absence window and the plugin locks — and since unlocking needs fresh proof, you type the password once. Raise `Silence (s)` if that happens to you.
 - **BlueZ serves a cached advertisement payload, so it cannot prove liveness.** `AdvertisingFlags`, `AdvertisingData`, `ManufacturerData` and `ServiceData` are *caches* of the last advertisement BlueZ processed. On a paired+trusted phone every one of them stayed byte-identical for minutes while the phone sat next to the laptop.
+- **A cached RSSI value is not proof of life either.** BlueZ keeps the last RSSI it saw in the device object, so right after a shell restart the plugin reads a value that may be hours old. The helper therefore announces that value as `rssi-cache` (a value, not a measurement) and never lets it refresh the freshness clock. The `busctl` fallback follows the same rule: the property is only rewritten when BlueZ actually heard the device, so the first poll merely seeds a baseline and only a *change* against the previous poll counts as proof of life. Without this the chart would draw a frozen line and a dead phone would look alive.
 - **Some phones drop BR/EDR while still broadcasting BLE advertisements.** This is the "fast sleep" pattern: BR/EDR idles or suspends to save power, but the BLE radio keeps sending advertisements. The plugin therefore treats the RSSI value — refreshed by the helper on every advertisement — as the primary signal and the BR/EDR ACL as a bonus.
 - **Auto-unlock bypasses PAM.** When the patch is installed, the plugin can drop the lock UI without a password after `unlockStableMs` of stable presence. Equivalent to macOS / Windows smart-unlock — a relay attacker within BLE range could trigger it. Auto-unlock only fires for locks this plugin triggered (manual locks via `omarchy-system-lock` keybind are left alone). `autoLockSource` is per-lock state.
 - **No `hyprlock` / `swaylock` fallback.** Omarchy uses Quickshell's `WlSessionLock`. If you replace that, this plugin's lock call will silently lock you out of the lock UI.
@@ -156,6 +167,7 @@ omarchy-shell bleguard.ctrl status | python3 -m json.tool | grep -E '"rssi"|pres
 - `rssiSource: "helper"` and `helperReady: true` → the heartbeat works.
 - `helperRestarts` climbing → the helper keeps dying (BlueZ restart, missing `python3-gobject`); `helperError` says why.
 - `presenceLevel: "rssi-stale"` → the phone is quiet right now; `rssiAgeMs` tells you for how long. The last known value is still driving the decision.
+- `presenceLevel: "absent"` → the phone has not answered for longer than `absentAfterMs` (and the BR/EDR link is down): the plugin is treating the silence as "out of range". If the phone is really next to the laptop, raise `Silence (s)` — that is the knob that trades a slow reaction for no false lock.
 
 **The laptop locks but never unlocks when I come back with the phone.**
 
@@ -175,7 +187,10 @@ omarchy-shell bleguard.ctrl status | python3 -m json.tool | grep -E '"rssi"|pres
 
 **The plugin locks the laptop while the phone is lying next to it.**
 
-Only if the *value* says so: the last RSSI was below the threshold. Lower the threshold (for example −90) or check `rssi` in the status output — a phone on the desk usually reads −35..−50 dBm.
+Two possible reasons:
+
+- the *value* says so: the last RSSI was below the threshold. Lower the threshold (for example −90) or check `rssi` in the status output — a phone on the desk usually reads −35..−50 dBm.
+- the *silence* says so: `presenceLevel: "absent"` means the phone stopped answering for longer than `absentAfterMs` and the BR/EDR link is down too. Raise `Silence (s)` (e.g. 300) and, if the phone really is on the desk, check whether BlueZ dropped the link: `bluetoothctl info <MAC>` shows `Connected: yes/no`.
 
 ## development
 

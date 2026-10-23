@@ -66,6 +66,21 @@ readonly property string state: svc ? svc.state : "DISARMED"
     return root.svc && root.svc.rssiStaleWindowMs !== undefined ? Number(root.svc.rssiStaleWindowMs) : 45000
   }
 
+  // How much time the chart shows. Fixed on purpose: the x axis is pinned to
+  // [now - chartWindowMs, now], so the curve really scrolls to the left as
+  // time passes. Stretching the whole stored history over the frame (the
+  // old behaviour) made the graph look frozen and squeezed the recent
+  // readings into a few pixels.
+  readonly property int chartWindowMs: 120000
+
+  // The live history, read straight from the service: a reassigned array
+  // can lose its change notification across the process boundary, and a
+  // stale copy would freeze the chart.
+  function svcHistory() {
+    if (!root.svc || root.svc.rssiHistory === undefined) return []
+    return root.svc.rssiHistory
+  }
+
   // Read the live values straight from the service instead of going through
   // the cached bindings above: Quickshell can drop the change notification
   // of a service property across the process boundary, which would freeze
@@ -89,6 +104,25 @@ readonly property string state: svc ? svc.state : "DISARMED"
   readonly property int graceSeconds: {
     root.tick
     return Math.round(root.svcGraceMs() / 1000)
+  }
+
+  // How long the phone has to stay completely silent (no ACL, no
+  // advertisement, no reading) before it counts as out of range — exactly
+  // like a measurement below the threshold. Stored in ms, shown in seconds.
+  function svcAbsentAfterMs() {
+    return root.svc && root.svc.absentAfterMs !== undefined ? Number(root.svc.absentAfterMs) : 45000
+  }
+  readonly property int absentSeconds: {
+    root.tick
+    return Math.round(root.svcAbsentAfterMs() / 1000)
+  }
+
+  // How long we have actually heard nothing from the phone.
+  readonly property int silenceAgeSec: {
+    root.tick
+    if (!root.svc) return 0
+    var ms = root.svc.silenceAgeMs()
+    return ms === undefined || ms === null ? 0 : Math.floor(ms / 1000)
   }
 
   readonly property int rssiValue: {
@@ -431,16 +465,20 @@ readonly property string state: svc ? svc.state : "DISARMED"
             //   1. BlueZ never exposed an RSSI at all (older BR/EDR-only
             //      phones) — the plugin falls back to the advertisement
             //      channel.
-            //   2. The phone went quiet: its beacon duty cycle, NOT a range
-            //      problem. The last known value is still shown and still
-            //      drives the decision. This is the case that used to
-            //      produce a bogus "Phone out of range" notification.
-            //   3. A fresh reading — nothing to warn about.
+            //   2. The phone went quiet for a while: its beacon duty cycle,
+            //      NOT a range problem. The last known value is still shown
+            //      and still drives the decision.
+            //   3. The phone went quiet for longer than the absence window
+            //      and the BR/EDR link is down too: it is unreachable
+            //      (radio off, or gone for good) and counts as out of range.
             Text {
               visible: root.armed && root.targetMac !== "" && (root.rssiValue === 0 || root.rssiStale)
               text: {
                 if (root.rssiValue === 0)
                   return "RSSI not exposed by BlueZ for this device. Most often: paired+trusted phones hide RSSI after bonding — BLE advertising still works, plugin still detects presence."
+                if (root.presenceLevel === "absent")
+                  return "No signal for " + Math.max(1, Math.floor(root.silenceAgeSec / 60)) + " min and the BR/EDR link is down: " +
+                         "the phone is unreachable, so it counts as OUT OF RANGE."
                 var mins = Math.max(1, Math.floor(root.rssiAgeSec / 60))
                 var verdict = root.inRange ? "still counted as IN RANGE" : "still counted as OUT OF RANGE"
                 return "Phone quiet for " + mins + " min (its beacon duty cycle, not a range problem). " +
@@ -481,6 +519,8 @@ readonly property string state: svc ? svc.state : "DISARMED"
                 Text {
                   text: {
                     if (root.presenceLevel === "acl") return "connected (BR/EDR link up)"
+                    if (root.presenceLevel === "absent")
+                      return "absent — no signal for " + root.silenceAgeSec + " s (out of range)"
                     if (root.rssiValue === 0) return "unknown — no reading yet"
                     var rel = root.inRange ? "≥" : "<"
                     var base = root.rssiValue + " dBm " + rel + " thr " + root.svcThreshold() + " → " + (root.inRange ? "in range" : "out of range")
@@ -661,7 +701,46 @@ readonly property string state: svc ? svc.state : "DISARMED"
                   var thrLabelY = (thrY - 8) > (pad + 6) ? (thrY - 8) : (thrY + 10)
                   ctx.fillText("thr " + chart.thr + "  ·  below = out of range", pad + 2, thrLabelY)
 
-                  if (!chart.history || chart.history.length < 2) {
+                  // ---- Fixed, scrolling window ----
+                  // The x axis is pinned to [now - chartWindowMs, now]: the
+                  // chart shows the last period only and the curve really
+                  // scrolls to the left as time passes. Stretching the whole
+                  // stored history over the frame (the old behaviour) kept
+                  // the graph frozen and squeezed the recent readings into a
+                  // few pixels.
+                  var now = Date.now()
+                  var winMs = root.chartWindowMs
+                  var tMin = now - winMs
+                  var tMax = now
+
+                  // Read the history live from the service: a cached copy can
+                  // lose its change notification across the process boundary
+                  // and would freeze the curve.
+                  var raw = root.svcHistory()
+                  var h0 = []
+                  for (var q = 0; q < (raw ? raw.length : 0); q++) {
+                    var pt = raw[q]
+                    if (!pt) continue
+                    var ptT = Number(pt.t)
+                    if (!ptT || ptT < tMin || ptT > tMax) continue
+                    h0.push(pt)
+                  }
+
+                  // Axis captions: the window length on the left, "now" on the
+                  // right. Drawn before any early return so the visible span
+                  // is documented even when the window holds no reading.
+                  var winLabel = winMs >= 60000
+                    ? ("last " + Math.round(winMs / 60000) + " min")
+                    : ("last " + Math.round(winMs / 1000) + " s")
+                  ctx.fillStyle = root.dim
+                  ctx.font = "9px monospace"
+                  ctx.textBaseline = "bottom"
+                  ctx.textAlign = "left"
+                  ctx.fillText(winLabel, pad + 2, height - 2)
+                  ctx.textAlign = "right"
+                  ctx.fillText("now", width - pad - 4, height - 2)
+
+                  if (h0.length === 0) {
                     ctx.fillStyle = root.dim
                     ctx.textAlign = "center"
                     ctx.textBaseline = "middle"
@@ -675,44 +754,45 @@ readonly property string state: svc ? svc.state : "DISARMED"
                       ctx.font = "8px monospace"
                       ctx.fillText("Plugin still uses BLE advertising for proximity.",
                                    width / 2, height / 2 + 8)
-                    } else if (root.rssiValue !== 0) {
-                      // We have a value, but it is older than the freshness
-                      // window: the phone went quiet. Draw the last known
-                      // level as a dashed line instead of an empty chart —
-                      // that is the level the decision is currently based on.
-                      var ly = Math.round(yForRssi(root.rssiValue)) + 0.5
-                      ctx.strokeStyle = Qt.rgba(root.foreground.r,
-                                                   root.foreground.g,
-                                                   root.foreground.b, 0.5)
-                      ctx.setLineDash([3, 4])
-                      ctx.lineWidth = 1
-                      ctx.beginPath()
-                      ctx.moveTo(pad, ly)
-                      ctx.lineTo(width - pad, ly)
-                      ctx.stroke()
-                      ctx.setLineDash([])
-                      ctx.fillStyle = root.dim
-                      ctx.font = "bold 10px monospace"
-                      ctx.fillText("last known " + root.rssiValue + " dBm",
-                                   width / 2, ly - 10)
-                      ctx.font = "8px monospace"
-                      ctx.fillText("phone quiet for " +
-                                   Math.max(1, Math.floor(root.rssiAgeSec / 60)) +
-                                   " min — no new advertisements",
-                                   width / 2, ly + 12)
                     } else {
-                      ctx.fillText("Collecting data…", width / 2, height / 2)
+                      // No reading inside the window. We still know the last
+                      // level we saw (even if it fell out of the window):
+                      // draw it as a dashed line — that is the level the
+                      // decision is currently based on.
+                      var lastAny = (raw && raw.length > 0) ? raw[raw.length - 1] : null
+                      var knownRssi = root.rssiValue !== 0
+                        ? root.rssiValue
+                        : (lastAny ? Number(lastAny.rssi) : 0)
+                      if (knownRssi !== 0) {
+                        var ly = Math.round(yForRssi(knownRssi)) + 0.5
+                        ctx.strokeStyle = Qt.rgba(root.foreground.r,
+                                                     root.foreground.g,
+                                                     root.foreground.b, 0.5)
+                        ctx.setLineDash([3, 4])
+                        ctx.lineWidth = 1
+                        ctx.beginPath()
+                        ctx.moveTo(pad, ly)
+                        ctx.lineTo(width - pad, ly)
+                        ctx.stroke()
+                        ctx.setLineDash([])
+                        ctx.fillStyle = root.dim
+                        ctx.font = "bold 10px monospace"
+                        ctx.fillText("last known " + knownRssi + " dBm",
+                                     width / 2, ly - 10)
+                        ctx.font = "8px monospace"
+                        ctx.fillText("no reading in the " + winLabel,
+                                     width / 2, ly + 12)
+                      } else {
+                        ctx.fillText("Collecting data…", width / 2, height / 2)
+                      }
                     }
                     return
                   }
 
-                  // X axis: oldest at left, newest at right. The axis ends
-                  // at "now" even when the last reading is older, so the
-                  // silence of a quiet phone is visible as empty space
-                  // instead of a line frozen at the right edge.
-                  var h0 = chart.history
-                  var tMin = h0[0].t
-                  var tMax = Math.max(h0[h0.length - 1].t, Date.now())
+                  // X axis: fixed window, oldest at left, "now" at right.
+                  // The axis ends at "now" even when the last reading is
+                  // older, so the silence of a quiet phone is visible as
+                  // empty space instead of a line frozen at the right edge.
                   var tRange = Math.max(tMax - tMin, 1)
 
                   function xForT(t) {
@@ -772,7 +852,7 @@ readonly property string state: svc ? svc.state : "DISARMED"
                   // value of a silent phone, so a frozen chart cannot be
                   // mistaken for a live reading.
                   var last = h0[h0.length - 1]
-                  var lastIsStale = (Date.now() - last.t) > gapMs
+                  var lastIsStale = (now - last.t) > gapMs
                   ctx.strokeStyle = root.foreground
                   ctx.fillStyle = lastIsStale ? "transparent" : root.foreground
                   ctx.lineWidth = 1.5
@@ -781,23 +861,11 @@ readonly property string state: svc ? svc.state : "DISARMED"
                   if (lastIsStale) ctx.stroke()
                   else ctx.fill()
 
-                  // "now" label on the right edge
-                  ctx.fillStyle = root.dim
-                  ctx.textAlign = "right"
-                  ctx.textBaseline = "bottom"
-                  ctx.font = "9px monospace"
-                  ctx.fillText("now →", width - pad - 2, height - 2)
-
-                  // Current value label next to the latest point
-                  var curLabel = last.rssi + " dBm" + (lastIsStale ? " (old)" : "")
-                  ctx.fillStyle = lastIsStale ? root.dim : root.foreground
-                  ctx.font = "bold 10px monospace"
-                  ctx.textAlign = "right"
-                  ctx.textBaseline = "middle"
-                  var curY = yForRssi(last.rssi)
-                  // Place label slightly above or below the dot depending on space
-                  var labelY = curY > pad + h - 16 ? curY - 10 : curY + 10
-                  ctx.fillText(curLabel, width - pad - 4, labelY)
+                  // The current value is already shown in the panel header
+                  // (with its "old" marker), so it is not repeated here: the
+                  // floating label used to land on top of the dBm axis labels
+                  // on the right edge. The window length and "now" are drawn
+                  // with the axis captions instead.
                 }
               }
             }
@@ -853,9 +921,23 @@ readonly property string state: svc ? svc.state : "DISARMED"
                 stepSize: 1
                 foreground: root.foreground
                 fontFamily: root.fontFamily
-                fieldWidth: Style.space(110)
+                fieldWidth: Style.space(100)
                 onModified: function(v) {
                   if (root.svc) root.svc.setGraceMs(v * 1000)
+                }
+              }
+              NumberField {
+                id: absentField
+                label: "Silence (s)"
+                value: root.absentSeconds
+                from: 0
+                to: 600
+                stepSize: 5
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fieldWidth: Style.space(100)
+                onModified: function(v) {
+                  if (root.svc) root.svc.setAbsentAfterMs(v * 1000)
                 }
               }
               NumberField {
@@ -881,7 +963,8 @@ readonly property string state: svc ? svc.state : "DISARMED"
                 "after " + root.graceSeconds + " s below the threshold the warning appears, then the screen locks via Omarchy " +
                 (root.svc && root.svc.graceSeconds !== undefined ? root.svc.graceSeconds : 10) + " s later if you are idle, " +
                 "or as soon as you have been idle for 30 s. " +
-                "If the phone stops advertising, the last known value keeps the decision instead of reporting a false \"out of range\". " +
+                "A phone that stops answering altogether (radio off, gone for good) counts as out of range too, after " +
+                root.absentSeconds + " s of silence — the BR/EDR link still being up is what keeps a quiet beacon from being read as absence. " +
                 "Unlocking requires fresh proof that the phone is back."
           color: root.dim
           font.family: root.fontFamily

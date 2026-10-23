@@ -23,6 +23,7 @@ const Ble = loadBleLogic()
 const NOW = 1_700_000_000_000
 const STALE = 45_000
 const THRESHOLD = -80
+const ABSENT = 45_000
 
 function opts(over) {
   return Object.assign(
@@ -36,6 +37,8 @@ function opts(over) {
       advertisingEverObserved: true,
       threshold: THRESHOLD,
       staleWindowMs: STALE,
+      absentAfterMs: ABSENT,
+      since: 0,
       warmup: false,
     },
     over || {},
@@ -59,16 +62,32 @@ test("value exactly on the threshold counts as present", () => {
 })
 
 // ---------------------------------------------------------------------------
-// The regression this whole change is about: a phone that stopped advertising
-// while sitting on the desk must NOT be reported as out of range.
+// A gap between two advertisements is not yet an absence: while the silence
+// is shorter than the absence window, the last known value still decides.
+// This is the case that used to produce a bogus "Phone out of range"
+// notification with the phone lying on the desk.
 // ---------------------------------------------------------------------------
 
-test("stale reading but the phone was last seen close: not out of range", () => {
+test("a fresh reading above the threshold: the phone is here", () => {
   const o = opts({
     connected: false,
     rssi: -45,
-    rssiAt: NOW - 10 * 60 * 1000, // ten minutes without an advertisement
-    advAt: NOW - 10 * 60 * 1000,
+    rssiAt: NOW - 20 * 1000, // still fresh
+    advAt: NOW - 20 * 1000,
+  })
+  assert.equal(Ble.phoneLost(o), false)
+  assert.equal(Ble.presenceLevel(o), "rssi")
+})
+
+test("with a wider absence window the last value keeps deciding during the silence", () => {
+  // The reading is older than the freshness window, but the silence has not
+  // yet outlasted the absence window: the remembered value still decides.
+  const o = opts({
+    connected: false,
+    rssi: -45,
+    rssiAt: NOW - 60 * 1000,
+    advAt: NOW - 60 * 1000,
+    absentAfterMs: 300000,
   })
   assert.equal(Ble.phoneLost(o), false)
   assert.equal(Ble.presenceLevel(o), "rssi-stale")
@@ -96,12 +115,15 @@ test("warm-up: no evidence yet, never report out of range", () => {
 })
 
 // ---------------------------------------------------------------------------
-// BlueZ removes the RSSI property as soon as it stops seeing the device, so
-// "no property" must never be read as "the phone left". This is the case
-// that made the plugin lock the laptop with the phone on the desk.
+// No signal at all is out of range.
+//
+// A phone that switches its radio off cannot send us a weak signal — it
+// simply stops answering. That silence is the only evidence left, and it is
+// treated exactly like a measurement below the threshold: grace period,
+// notification, lock.
 // ---------------------------------------------------------------------------
 
-test("no measurement at all: hold the state instead of reporting out of range", () => {
+test("no measurement at all and no reference point: hold the state", () => {
   const o = opts({
     connected: false,
     rssi: 0,
@@ -114,7 +136,80 @@ test("no measurement at all: hold the state instead of reporting out of range", 
   assert.equal(Ble.presenceLevel(o), "unknown")
 })
 
-test("a known value survives a silent advertisement channel", () => {
+test("a silence longer than the absence window counts as out of range", () => {
+  const o = opts({
+    connected: false,
+    rssi: -45, // the last value said "close"…
+    rssiAt: NOW - 60 * 1000,
+    advAt: NOW - 60 * 1000,
+  })
+  assert.equal(Ble.phoneLost(o), true) // …but the phone stopped answering
+  assert.equal(Ble.presenceLevel(o), "absent")
+})
+
+test("the absence window is configurable", () => {
+  const silent = {
+    connected: false,
+    rssi: -45,
+    rssiAt: NOW - 60 * 1000,
+    advAt: NOW - 60 * 1000,
+  }
+  // 60 s of silence: outside the default window, inside a wider one.
+  assert.equal(Ble.phoneLost(opts(silent)), true)
+  assert.equal(Ble.phoneLost(opts(Object.assign({}, silent, { absentAfterMs: 120000 }))), false)
+  // 0 = the first missing heartbeat is enough.
+  assert.equal(Ble.phoneLost(opts(Object.assign({}, silent, { absentAfterMs: 0 }))), true)
+})
+
+test("a live ACL link prevents the absence from firing", () => {
+  // The BR/EDR link is proof of presence on its own: a quiet BLE beacon
+  // while the phone sits on the desk must never read as absence.
+  const o = opts({
+    connected: true,
+    rssi: -45,
+    rssiAt: NOW - 60 * 60 * 1000,
+    advAt: NOW - 60 * 60 * 1000,
+  })
+  assert.equal(Ble.phoneLost(o), false)
+  assert.equal(Ble.presenceLevel(o), "acl")
+})
+
+test("a recent advertisement prevents the absence from firing", () => {
+  const o = opts({
+    connected: false,
+    rssi: -45,
+    rssiAt: NOW - 60 * 60 * 1000, // the reading is ancient
+    advAt: NOW - 1000, // but an advertisement just arrived
+  })
+  assert.equal(Ble.phoneLost(o), false)
+  assert.equal(Ble.presenceLevel(o), "rssi-stale") // the reading is old, the adv is fresh
+})
+
+test("the silence clock starts when we began waiting for a phone we never heard", () => {
+  const o = opts({
+    connected: false,
+    rssi: 0,
+    rssiAt: 0,
+    rssiEverObserved: false,
+    advAt: 0,
+    advertisingEverObserved: false,
+    since: NOW - 60 * 1000,
+  })
+  assert.equal(Ble.phoneLost(o), true)
+  assert.equal(Ble.presenceLevel(o), "absent")
+})
+
+test("the silence age is measured from the last piece of evidence", () => {
+  assert.equal(Ble.silenceAgeMs(opts({ rssiAt: NOW - 5000, advAt: 0 })), 5000)
+  // The newest evidence wins.
+  assert.equal(Ble.silenceAgeMs(opts({ rssiAt: NOW - 5000, advAt: NOW - 1000 })), 1000)
+  // No evidence at all: the age is unknown, not zero.
+  assert.equal(Ble.silenceAgeMs(opts({ rssiAt: 0, advAt: 0 })), null)
+  // Without a reference point there is nothing to measure.
+  assert.equal(Ble.absentBySilence(opts({ rssiAt: 0, advAt: 0 })), false)
+})
+
+test("a known value survives a silent advertisement channel — until the window is over", () => {
   const o = opts({
     connected: false,
     rssi: -45,
@@ -122,7 +217,9 @@ test("a known value survives a silent advertisement channel", () => {
     advAt: NOW - 90 * 60 * 1000,
     advertisingEverObserved: true,
   })
-  assert.equal(Ble.phoneLost(o), false)
+  // 1.5 h of silence is way past the absence window: the phone is gone.
+  assert.equal(Ble.phoneLost(o), true)
+  assert.equal(Ble.presenceLevel(o), "absent")
 })
 
 // ---------------------------------------------------------------------------
@@ -181,10 +278,23 @@ test("presence level: nothing at all", () => {
     rssi: 0,
     rssiAt: 0,
     rssiEverObserved: false,
-    advAt: NOW - STALE - 1,
+    advAt: 0,
+    advertisingEverObserved: false,
   })
   assert.equal(Ble.presenceLevel(o), "unknown")
   assert.equal(Ble.presenceSource(o), "none")
+})
+
+test("presence level: the last advertisement is older than the absence window", () => {
+  const o = opts({
+    connected: false,
+    rssi: 0,
+    rssiAt: 0,
+    rssiEverObserved: false,
+    advAt: NOW - STALE - 1,
+    advertisingEverObserved: true,
+  })
+  assert.equal(Ble.presenceLevel(o), "absent")
 })
 
 // ---------------------------------------------------------------------------
@@ -198,8 +308,8 @@ test("unlock needs fresh evidence: a stale strong reading is not enough", () => 
     rssiAt: NOW - 10 * 60 * 1000,
     advAt: NOW - 10 * 60 * 1000,
   })
-  assert.equal(Ble.phoneLost(o), false) // not "lost" ...
-  assert.equal(Ble.phonePresent(o), false) // ... but not proof of presence
+  assert.equal(Ble.phoneLost(o), true) // out of range: the phone is silent ...
+  assert.equal(Ble.phonePresent(o), false) // ... but not proof that it is back
 })
 
 test("unlock: a fresh strong reading is proof of presence", () => {
@@ -265,8 +375,9 @@ test("an unknown age is restored as stale, never as fresh", () => {
   })
   assert.equal(Ble.isRssiFresh(o), false)
   assert.equal(Ble.phonePresent(o), false)
-  // ...but the value still decides, so the phone is not reported as gone.
-  assert.equal(Ble.phoneLost(o), false)
+  // The reading is older than the absence window, so the phone counts as
+  // gone — but a restored reading can never unlock the laptop on its own.
+  assert.equal(Ble.phoneLost(o), true)
 })
 
 test("round trip: save the real age, restore it, and it is still the real age", () => {
@@ -382,4 +493,26 @@ test("signal bars", () => {
   assert.equal(Ble.signalBars(-75), 2)
   assert.equal(Ble.signalBars(-85), 1)
   assert.equal(Ble.signalBars(-120), 0)
+})
+
+// ---------------------------------------------------------------------------
+// busctl fallback: a cached RSSI value is not proof of life
+// ---------------------------------------------------------------------------
+
+test("the first polled value is not proof of life (it may be a cached value)", () => {
+  assert.equal(Ble.pollProvesLife(0, -51), false)
+  assert.equal(Ble.pollProvesLife(undefined, -51), false)
+})
+
+test("a repeated polled value is not proof of life", () => {
+  assert.equal(Ble.pollProvesLife(-51, -51), false)
+})
+
+test("a changed polled value is proof of life", () => {
+  assert.equal(Ble.pollProvesLife(-51, -55), true)
+})
+
+test("an unusable reading is never proof of life", () => {
+  assert.equal(Ble.pollProvesLife(-51, 0), false)
+  assert.equal(Ble.pollProvesLife(-51, null), false)
 })
