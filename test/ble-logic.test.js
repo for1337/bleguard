@@ -516,3 +516,75 @@ test("an unusable reading is never proof of life", () => {
   assert.equal(Ble.pollProvesLife(-51, 0), false)
   assert.equal(Ble.pollProvesLife(-51, null), false)
 })
+
+// ---------------------------------------------------------------------------
+// Helper events are bound to the phone they belong to.
+//
+// The discovery helper watches a single phone. When the user picks another
+// one, the helper has to be rebound — but the old process can still deliver
+// a few lines before it is gone. Those lines describe the *previous* phone:
+// accepting them would keep the laptop unlocked (or prevent the auto-lock)
+// while the new phone is nowhere near the laptop.
+// ---------------------------------------------------------------------------
+
+const MAC = "EC:2F:90:89:5F:3C"
+const OTHER_MAC = "AA:BB:CC:DD:EE:FF"
+
+test("a helper line carries the MAC of the phone it watches", () => {
+  assert.equal(Ble.helperLineMac(`${MAC} rssi -60`), MAC)
+  assert.equal(Ble.helperLineMac(`${MAC} ready`), MAC)
+})
+
+test("an untagged helper line has no MAC", () => {
+  assert.equal(Ble.helperLineMac("rssi -60"), null)
+  assert.equal(Ble.helperLineMac("ready"), null)
+  assert.equal(Ble.helperLineMac(""), null)
+  assert.equal(Ble.helperLineMac(null), null)
+})
+
+test("a reading from the current target is accepted", () => {
+  const parsed = Ble.parseHelperLine(`${MAC} rssi -60`, MAC)
+  assert.equal(parsed.kind, "rssi")
+  assert.equal(parsed.value, -60)
+})
+
+test("a reading from the previous target is rejected", () => {
+  assert.equal(Ble.parseHelperLine(`${OTHER_MAC} rssi -60`, MAC), null)
+})
+
+test("an untagged line is rejected", () => {
+  assert.equal(Ble.parseHelperLine("rssi -60", MAC), null)
+})
+
+test("a line is rejected when there is no target at all", () => {
+  assert.equal(Ble.parseHelperLine(`${MAC} rssi -60`, ""), null)
+})
+
+test("the cached value is parsed but flagged as a cache, not a measurement", () => {
+  const parsed = Ble.parseHelperLine(`${MAC} rssi-cache -57`, MAC)
+  assert.equal(parsed.kind, "rssi-cache")
+  assert.equal(parsed.value, -57)
+})
+
+test("a cached value from the previous target is rejected", () => {
+  assert.equal(Ble.parseHelperLine(`${OTHER_MAC} rssi-cache -57`, MAC), null)
+})
+
+test("ready, device and error lines are parsed", () => {
+  assert.equal(Ble.parseHelperLine(`${MAC} ready`, MAC).kind, "ready")
+  assert.equal(Ble.parseHelperLine(`${MAC} device /org/bluez/hci0/dev_X`, MAC).kind, "device")
+  const err = Ble.parseHelperLine(`${MAC} error discovery stopped`, MAC)
+  assert.equal(err.kind, "error")
+  assert.equal(err.text, "discovery stopped")
+})
+
+test("the MAC comparison ignores case", () => {
+  const parsed = Ble.parseHelperLine(`${MAC.toLowerCase()} rssi -60`, MAC)
+  assert.equal(parsed.kind, "rssi")
+  assert.equal(parsed.value, -60)
+})
+
+test("a malformed payload is rejected instead of guessed", () => {
+  assert.equal(Ble.parseHelperLine(`${MAC} rssi not-a-number`, MAC), null)
+  assert.equal(Ble.parseHelperLine(`${MAC} rssi-cache nope`, MAC), null)
+})

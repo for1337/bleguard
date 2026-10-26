@@ -99,6 +99,16 @@ Item {
     return null
   }
 
+  // Is `path` the D-Bus object of the phone we are currently watching?
+  //
+  // A poll that was started for another phone must not decide the presence
+  // of the current one: its cached value says nothing about this device.
+  function isCurrentTargetPath(path) {
+    if (!path) return false
+    var dev = service.findTargetDevice()
+    return !!(dev && dev.dbusPath === path)
+  }
+
   // ---- RSSI tracking (requires BlueZ discovery on) ------------------
   // Use var for timestamps — Date.now() in 2026 is ~1.79e12 ms since epoch,
   // which overflows QML's 32-bit int (max 2.1e9) and silently truncates to
@@ -120,10 +130,16 @@ Item {
   // The first poll after a restart only seeds this baseline: the value it
   // returns may be hours old.
   property var lastPollRssi: 0
+  // The device path the *running* poll reads. A poll that was started for
+  // another phone says nothing about the current one, so its result is
+  // dropped when the path no longer matches the target.
+  property string pollPath: ""
   // The device path the poll baseline belongs to. A different device (a
   // re-pair) invalidates the baseline: its value says nothing about the new
   // device.
-  property string pollPath: ""
+  property string pollBaselinePath: ""
+  // The device path the running advertisement poll reads.
+  property string advPath: ""
 
   // "Phone is advertising" evidence. BlueZ populates AdvertisingFlags /
   // ManufacturerData when an advertisement is processed while Discovering=true,
@@ -167,6 +183,21 @@ Item {
   // How many times the helper had to be restarted — surfaces a broken
   // installation in the status IPC instead of failing silently.
   property int helperRestarts: 0
+  // True when the helper *should* be running. The single source of truth for
+  // its lifecycle: a deliberate stop can never be undone by the exit handler,
+  // and a rebind knows whether the helper is expected to come back.
+  property bool helperWanted: false
+  // True while the helper must be started again with a different command.
+  // Quickshell applies a new command only on the *next* start, so the old
+  // process has to exit first — otherwise the helper would keep watching
+  // the previous phone.
+  property bool helperRebindPending: false
+  // Helper lines that were rejected because they belong to another device
+  // (the phone that was selected before). Non-zero means a rebind is in
+  // flight, or that a stale helper is still around.
+  property int helperForeignEvents: 0
+  // Helper lines that carried no MAC tag at all (an older helper build).
+  property int helperUntaggedEvents: 0
   readonly property real distanceMeters: {
     if (!lastRssi || lastRssi === 0) return 0
     return Math.pow(10, (service.txPowerDbm - lastRssi) / (10 * service.pathLoss))
@@ -432,7 +463,38 @@ Item {
     }
     onExited: function(exitCode, exitStatus) {
       service.helperReady = false
-      if (service.armed && service.targetMac) {
+      if (service.helperRebindPending) {
+        // The old process is gone: now the new command takes effect. This is
+        // the only moment where the helper can be pointed at another phone.
+        service.helperRebindPending = false
+        if (service.helperWanted && service.armed && service.targetMac
+            && service.findTargetDevice()) {
+          helperProc.command = service.helperCommand()
+          helperProc.running = true
+        } else {
+          // The new target is not known to BlueZ yet: there is nothing to
+          // watch. The poll timer starts the helper as soon as it shows up.
+          service.helperWanted = false
+        }
+        return
+      }
+      if (exitCode === 70) {
+        // Configuration error (the helper could not determine the phone it
+        // has to watch): restarting would only repeat it.
+        service.helperError = "helper could not determine the target device"
+        console.warn("bleguard: helper configuration error, not restarting")
+        return
+      }
+      if (!service.findTargetDevice()) {
+        // The target is not known to BlueZ (a phone that was paired to
+        // another machine, or a device that vanished). There is nothing to
+        // watch: the command would be a no-op, and restarting it would only
+        // spin. The poll timer brings the helper back as soon as the
+        // device shows up again.
+        service.helperWanted = false
+        return
+      }
+      if (service.helperWanted && service.armed && service.targetMac) {
         // The helper is a long-lived session; if it dies (BlueZ restart,
         // D-Bus reset, ...) bring it back after a short delay.
         service.helperRestarts += 1
@@ -446,7 +508,7 @@ Item {
     interval: 3000
     repeat: false
     onTriggered: {
-      if (service.armed && service.targetMac && !helperProc.running) {
+      if (service.helperWanted && service.armed && service.targetMac && !helperProc.running) {
         helperProc.command = service.helperCommand()
         helperProc.running = true
       }
@@ -515,24 +577,40 @@ Item {
       "  [ -f \"$d\" ] && exec python3 \"$d\" \"$@\"; " +
       "done; " +
       "echo 'bleguard-discovery.py not found' >&2; exit 1",
-      "bleguard-discovery", "--adapter", adapterPath, "--device", devicePath]
+      "bleguard-discovery", "--adapter", adapterPath, "--device", devicePath,
+      // The MAC tags every line the helper prints: the consumer can then
+      // reject the lines of a helper that still watches the previous phone.
+      "--mac", String(service.targetMac).toUpperCase()]
   }
 
   function onHelperLine(data) {
     var line = String(data === undefined || data === null ? "" : data).trim()
     if (line.length === 0) return
-    if (line === "ready") {
+    // Every helper line carries the MAC of the phone the helper watches. A
+    // line from another device — the helper that has not exited yet after a
+    // target change — must never touch the shared presence state: its
+    // readings would keep the laptop unlocked or prevent the auto-lock.
+    if (!Ble.helperLineMac(line)) {
+      service.helperUntaggedEvents += 1
+      return
+    }
+    var parsed = Ble.parseHelperLine(line, service.targetMac)
+    if (!parsed) {
+      service.helperForeignEvents += 1
+      return
+    }
+    if (parsed.kind === "ready") {
       service.helperReady = true
       service.helperError = ""
       return
     }
-    if (line.indexOf("rssi-cache ") === 0) {
+    if (parsed.kind === "rssi-cache") {
       // The value BlueZ has cached from the last time it saw the device. It
       // may be hours old: it is a value, not proof of life. Recording it
       // without touching lastRssiAt keeps the age honest — otherwise a
       // restart would make a dead phone look fresh and alive.
-      var cached = parseInt(line.substring(11).trim(), 10)
-      if (isNaN(cached) || cached === 0) return
+      var cached = parsed.value
+      if (!cached || cached === 0) return
       if (service.lastRssi !== cached) {
         service.lastRssiValueChangeAt = Date.now()
         service.lastRssi = cached
@@ -540,9 +618,9 @@ Item {
       }
       return
     }
-    if (line.indexOf("rssi ") === 0) {
-      var n = parseInt(line.substring(5).trim(), 10)
-      if (isNaN(n) || n === 0) return
+    if (parsed.kind === "rssi") {
+      var n = parsed.value
+      if (!n || n === 0) return
       var now = Date.now()
       if (service.lastRssi !== n) {
         service.lastRssiValueChangeAt = now
@@ -560,23 +638,92 @@ Item {
       service.evaluateProximity()
       return
     }
-    if (line.indexOf("error ") === 0) {
-      service.helperError = line.substring(6).trim()
+    if (parsed.kind === "error") {
+      service.helperError = parsed.text
       console.warn("bleguard: helper error: " + service.helperError)
     }
   }
 
   function startHelper() {
     if (!service.armed || !service.targetMac) return
+    if (!service.findTargetDevice()) {
+      // Nothing to watch: the target device is not known to BlueZ. Starting
+      // the helper would only run a command that cannot do anything.
+      service.helperWanted = false
+      return
+    }
+    service.helperWanted = true
     if (helperProc.running) return
     helperProc.command = service.helperCommand()
     helperProc.running = true
   }
 
   function stopHelper() {
+    service.helperWanted = false
+    service.helperRebindPending = false
     helperRestartTimer.stop()
     if (helperProc.running) helperProc.running = false
     service.helperReady = false
+  }
+
+  // Point the helper at the current target.
+  //
+  // The helper watches exactly one phone, so a target change has to restart
+  // it: the running process still holds the *old* device path and would keep
+  // streaming the previous phone's readings. Quickshell applies a new
+  // command only on the next start, so the old process is stopped first and
+  // the new command is set when it has exited (see helperProc.onExited).
+  function rebindHelper() {
+    if (!service.armed || !service.targetMac) {
+      stopHelper()
+      return
+    }
+    // The running helper watches the *previous* phone: it has to go, whether
+    // or not the new target is already known to BlueZ.
+    if (helperProc.running) {
+      service.helperRebindPending = true
+      helperProc.running = false
+      return
+    }
+    if (!service.findTargetDevice()) {
+      // The new target is not known to BlueZ: there is nothing to watch yet.
+      service.helperWanted = false
+      return
+    }
+    service.helperWanted = true
+    helperProc.command = service.helperCommand()
+    helperProc.running = true
+  }
+
+  // Forget everything we knew about the previous phone: its last reading,
+  // its advertisement, the poll baseline, the presence clocks and the
+  // chart. The evidence of one phone says nothing about another, and a
+  // stale reading must never decide the presence of the new one.
+  function resetPresenceState() {
+    service.lastRssi = 0
+    service.lastRssiAt = 0
+    service.lastRssiValueChangeAt = 0
+    service.lastPollRssi = 0
+    service.pollPath = ""
+    service.pollBaselinePath = ""
+    service.advPath = ""
+    service.lastAdvAt = 0
+    service.lastAdvBytes = ""
+    service.advBytesSeeded = false
+    service.advertisingEverObserved = false
+    service.rssiEverObserved = false
+    service.rssiSource = "none"
+    service.phoneLostSince = 0
+    service.phoneBackSince = 0
+    service.presenceSince = 0
+    service.rssiHistory = []
+    service.helperReady = false
+    // The lock was triggered by the previous phone: the new one has no
+    // business unlocking it, and the pending unlock request is void.
+    service.autoLockSource = false
+    service.unlockRequested = false
+    service.unlockFailures = 0
+    service.lastUnlockResult = ""
   }
 
   Process {
@@ -586,6 +733,9 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
+        // The poll may have been started for the previous phone: its value
+        // says nothing about the current one.
+        if (!service.isCurrentTargetPath(service.pollPath)) return
         var n = Ble.parseBusctlRssi(text || "")
         if (n === null || n === 0) return
         var now = Date.now()
@@ -643,21 +793,33 @@ Item {
     var path = dev.dbusPath
     // A different device invalidates the poll baseline: the cached value of
     // the previous phone says nothing about this one.
-    if (service.pollPath !== path) {
-      service.pollPath = path
+    if (service.pollBaselinePath !== path) {
+      service.pollBaselinePath = path
       service.lastPollRssi = 0
     }
+    // The command of a running process is applied on its next start only, so
+    // the command is not touched while the poll is in flight. The path that
+    // is actually being read is recorded with the process, and the result is
+    // checked against it: a poll that was started for the previous phone
+    // must not decide the presence of the new one.
+    //
     // Poll RSSI regardless of ACL state. Some phones expose RSSI even
     // while BR/EDR is asleep (it stays in BlueZ's advertising cache),
     // and on others a "No such property" response just leaves the timer
     // alive (see rssiProc.onExited). Skipping the poll when disconnected
     // leaves the chart frozen at the last reading.
-    rssiProc.command = ["busctl", "get-property", "org.bluez",
-                        path, "org.bluez.Device1", "RSSI"]
-    rssiProc.running = true
-    advProc.command = ["busctl", "get-property", "org.bluez",
-                       path, "org.bluez.Device1", "AdvertisingFlags"]
-    advProc.running = true
+    if (!rssiProc.running) {
+      rssiProc.command = ["busctl", "get-property", "org.bluez",
+                          path, "org.bluez.Device1", "RSSI"]
+      service.pollPath = path
+      rssiProc.running = true
+    }
+    if (!advProc.running) {
+      advProc.command = ["busctl", "get-property", "org.bluez",
+                         path, "org.bluez.Device1", "AdvertisingFlags"]
+      service.advPath = path
+      advProc.running = true
+    }
     // The helper is the primary RSSI source: it holds the filtered
     // discovery session open and turns the RSSI into a heartbeat.
     service.startHelper()
@@ -675,6 +837,9 @@ Item {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
+        // The poll may have been started for the previous phone: its
+        // advertisement says nothing about the current one.
+        if (!service.isCurrentTargetPath(service.advPath)) return
         // busctl prints "ay <count> <bytes...>". Empty when no advertisement
         // is cached: "ay 0" or "ay 0\n". Same string twice = BlueZ still
         // handing back the same cached ad; treat that as no new ad and
@@ -1080,7 +1245,20 @@ Item {
 
   function setTarget(mac) {
     if (typeof mac !== "string") return false
-    persisted.targetMac = mac.trim()
+    var next = mac.trim()
+    var changed = next.toUpperCase() !== String(persisted.targetMac).trim().toUpperCase()
+    persisted.targetMac = next
+    if (changed) {
+      // Everything we knew was about the *previous* phone: its last reading,
+      // its advertisement, the poll baseline, the presence clocks. None of it
+      // says anything about the new one, and a stale reading must never
+      // decide the presence of another device.
+      service.resetPresenceState()
+      // The running helper still watches the old device: it has to be
+      // stopped and started again with the new command, and until it is
+      // rebound its lines are rejected by their MAC tag.
+      service.rebindHelper()
+    }
     // Fresh pairing — restart the warm-up so we don't immediately fire
     // a WARNING because RSSI hasn't been polled yet.
     service.state = service.armed ? "ARMED" : "DISARMED"
@@ -1172,6 +1350,8 @@ Item {
         helperReady: service.helperReady,
         helperError: service.helperError,
         helperRestarts: service.helperRestarts,
+        helperForeignEvents: service.helperForeignEvents,
+        helperUntaggedEvents: service.helperUntaggedEvents,
         unlockResult: service.lastUnlockResult,
         unlockFailures: service.unlockFailures,
         unlockRequested: service.unlockRequested,

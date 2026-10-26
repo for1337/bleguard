@@ -16,16 +16,24 @@ That is the same rule the chart in the popup draws, so the graph and the state c
 
 The grace period is the delay between "the value crossed the threshold" and "the notification appears and the lock procedure starts". A reading that flaps around the threshold never reaches it, so one noisy sample cannot lock the laptop. It stretches across short flaps (a 2 s reconnect does not restart it) but a **stable** return resets it — otherwise the counter would survive the whole session and the second drop would fire the notification instantly. Tune it in the popup (`Grace (s)`, default 5, range 0..300) or with `omarchy-shell bleguard.ctrl setGraceMs <ms>`.
 
-The RSSI arrives through a small helper (`bleguard-discovery.py`) that holds a **filtered discovery session** open on the adapter. BlueZ only republishes the `RSSI` property when the value moves by 8 dBm (`RSSI_THRESHOLD` in `device.c`), which froze the reading at −45 dBm and left the chart stuck; in a filtered session BlueZ republishes it on *every* advertisement, so the property becomes a real heartbeat. The helper streams the values over stdout:
+The RSSI arrives through a small helper (`bleguard-discovery.py`) that holds a **filtered discovery session** open on the adapter. BlueZ only republishes the `RSSI` property when the value moves by 8 dBm (`RSSI_THRESHOLD` in `device.c`), which froze the reading at −45 dBm and left the chart stuck; in a filtered session BlueZ republishes it on *every* advertisement, so the property becomes a real heartbeat. The helper streams the values over stdout, every line prefixed with the MAC of the phone it watches:
 
 ```
-ready          discovery is active and the subscription is live
-rssi <int>     the device's RSSI changed to <int> dBm
-device <path>  the device object moved to a new D-Bus path
-error <text>   recoverable error, the helper keeps running
+<mac> ready          discovery is active and the subscription is live
+<mac> rssi <int>     the device's RSSI changed to <int> dBm
+<mac> device <path>  the device object moved to a new D-Bus path
+<mac> error <text>   recoverable error, the helper keeps running
 ```
 
 The `busctl` poll every 2 s is kept as a fallback for when the helper cannot run.
+
+### Switching to another phone
+
+Picking a different phone in the popup is a hard cut: **nothing the plugin knew about the previous phone survives it.** The last reading, the advertisement, the poll baseline, the presence clocks and the chart are dropped, and the discovery helper is stopped and started again against the new device.
+
+That matters because the helper watches exactly one phone: without the cut, the old helper would keep streaming the *previous* phone's readings, and they would keep the laptop unlocked (or prevent the auto-lock) while the new phone is nowhere near the computer. The MAC prefix on every helper line is what makes the cut safe — a line that belongs to another device is dropped instead of being applied to the current one, even if it arrives while the old helper is still shutting down. The same rule applies to the `busctl` fallback: a poll that was started for the old device is discarded when its result arrives.
+
+`helperForeignEvents` and `helperUntaggedEvents` in the status output count the lines that were dropped this way.
 
 ### How a stale reading is treated
 
@@ -132,6 +140,7 @@ The `status` JSON exposes the fields that explain *why* the plugin behaves the w
 | `rssiSource` | `helper` (the filtered-discovery session), `poll` (the busctl fallback) or `none` |
 | `phonePresent` | positive proof that the phone is back — what gates the auto-unlock |
 | `helperReady` / `helperError` / `helperRestarts` | state of the discovery helper; `helperRestarts` climbing means the helper keeps dying |
+| `helperForeignEvents` / `helperUntaggedEvents` | lines dropped because they belong to a different phone, or because they carry no MAC tag — after a target switch these count the late events of the previous phone |
 | `unlockResult` | raw result of the last unlock IPC attempt (`ok`, `not-locked`, or the error string) |
 | `unlockFailures` | consecutive failed unlock attempts |
 | `advAt` | when the advertisement payload last changed |

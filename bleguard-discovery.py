@@ -24,16 +24,24 @@ helper is required.
 
 Protocol (stdout, one line per event, flushed immediately)
 ----------------------------------------------------------
-    ready            discovery is active and the subscription is live
-    rssi <int>       the device's RSSI property changed to <int> dBm
-    rssi-cache <int> the *cached* RSSI value at startup (not a measurement)
-    device <path>    the device object moved to a new D-Bus path
-    error <text>     recoverable error; the helper keeps running
+Every line is prefixed with the MAC of the phone this helper watches:
+
+    <mac> ready            discovery is active and the subscription is live
+    <mac> rssi <int>       the device's RSSI property changed to <int> dBm
+    <mac> rssi-cache <int> the *cached* RSSI value at startup (not a measurement)
+    <mac> device <path>    the device object moved to a new D-Bus path
+    <mac> error <text>     recoverable error; the helper keeps running
 
 ``rssi`` is a heartbeat: it arrives on every advertisement, so the consumer
 can tell a live phone from a dead one.  ``rssi-cache`` is only the value
 BlueZ has cached from the last time it saw the device — it may be hours old
 — and must never be used as proof of life.
+
+The MAC prefix is not decoration.  The helper watches exactly one phone, and
+the consumer can change the phone it watches while this process is still
+running: the lines that arrive afterwards describe the *previous* phone and
+must never touch the shared presence state.  Tagging every line lets the
+consumer reject them without having to guess which process they came from.
 
 The helper exits when it receives SIGTERM/SIGINT; on the way out it stops
 the discovery session it owns.
@@ -53,9 +61,24 @@ except Exception as exc:  # pragma: no cover - environment problem
     sys.exit(70)
 
 
-def emit(line):
-    sys.stdout.write(line + "\n")
-    sys.stdout.flush()
+def mac_from_path(path):
+    """MAC address encoded in a BlueZ device object path.
+
+    BlueZ derives the object path from the device's identity address
+    ("/org/bluez/hci0/dev_EC_2F_90_89_5F_3C"), so the path carries the MAC
+    even when the caller did not pass it.  Returns "" when the path does not
+    look like a device object.
+    """
+    if not path or "/dev_" not in path:
+        return ""
+    tail = path[path.rindex("/dev_") + 5 :]
+    parts = tail.split("_")
+    if len(parts) != 6:
+        return ""
+    for part in parts:
+        if len(part) != 2:
+            return ""
+    return ":".join(parts).upper()
 
 
 def variant_to_int(value):
@@ -103,6 +126,11 @@ class Discovery:
         self.adapter_path = adapter_path
         self.device_path = device_path
         self.device_mac = device_mac
+        # The MAC every emitted line is tagged with. It is what binds an
+        # event to the phone it belongs to, so it must be known before the
+        # first line is printed: an untagged line would be indistinguishable
+        # from the previous phone's leftovers.
+        self.mac = (device_mac or mac_from_path(device_path)).strip().upper()
         self.loop = GLib.MainLoop()
         self.bus = None
         self.adapter = None
@@ -116,8 +144,21 @@ class Discovery:
         elif device_mac:
             self.device_suffix = "/dev_" + device_mac.replace(":", "_").upper()
 
+    def emit(self, line):
+        """Print one protocol line, tagged with the watched phone's MAC."""
+        sys.stdout.write("%s %s\n" % (self.mac, line))
+        sys.stdout.flush()
+
     # -- lifecycle ---------------------------------------------------------
     def run(self):
+        if not self.mac:
+            # Fail closed: without a MAC the lines cannot be attributed to a
+            # phone, and an unattributable line must never be accepted.
+            sys.stderr.write(
+                "bleguard-discovery: no device MAC given and none derivable "
+                "from the device path — refusing to emit untagged lines\n"
+            )
+            return 70
         signal.signal(signal.SIGTERM, self._on_signal)
         signal.signal(signal.SIGINT, self._on_signal)
         try:
@@ -126,9 +167,9 @@ class Discovery:
             self._start_discovery()
             self._subscribe()
         except GLib.Error as exc:
-            emit("error %s" % exc.message)
+            self.emit("error %s" % exc.message)
             return 1
-        emit("ready")
+        self.emit("ready")
         self.started = True
         # Keep an eye on the discovery session: if the adapter is reset or
         # BlueZ restarts, the session dies with it and the RSSI would stay
@@ -147,10 +188,10 @@ class Discovery:
         try:
             discovering = self.adapter.get_cached_property("Discovering")
             if discovering is None or not discovering.get_boolean():
-                emit("error discovery stopped, restarting")
+                self.emit("error discovery stopped, restarting")
                 self._start_discovery()
         except GLib.Error as exc:
-            emit("error %s" % exc.message)
+            self.emit("error %s" % exc.message)
         return True
 
     # -- BlueZ -------------------------------------------------------------
@@ -300,9 +341,9 @@ class Discovery:
             )
             prop = proxy.get_cached_property("RSSI")
             if prop is not None:
-                emit("rssi-cache %d" % variant_to_int(prop))
+                self.emit("rssi-cache %d" % variant_to_int(prop))
         except GLib.Error as exc:
-            emit("error %s" % exc.message)
+            self.emit("error %s" % exc.message)
 
     # -- events ------------------------------------------------------------
     def _on_properties_changed(self, _conn, _sender, path, _iface, _name, params):
@@ -314,17 +355,21 @@ class Discovery:
                 return
             if path != self.device_path:
                 self.device_path = path
-                emit("device %s" % path)
-            emit("rssi %d" % variant_to_int(changed["RSSI"]))
+                self.emit("device %s" % path)
+            self.emit("rssi %d" % variant_to_int(changed["RSSI"]))
         except Exception as exc:  # pragma: no cover - defensive
-            emit("error %s" % exc)
+            self.emit("error %s" % exc)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--adapter", help="BlueZ adapter object path")
     parser.add_argument("--device", help="BlueZ device object path")
-    parser.add_argument("--mac", help="device address, used to find the device path")
+    parser.add_argument(
+        "--mac",
+        help="device address: used to find the device path and to tag every "
+        "emitted line with the phone it belongs to",
+    )
     args = parser.parse_args()
     if not args.adapter and not args.device:
         parser.error("either --adapter/--device or --mac is required")

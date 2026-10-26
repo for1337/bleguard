@@ -14,6 +14,64 @@ function parseBusctlRssi(stdout) {
     return n
 }
 
+// The MAC tag of a helper line: "<mac> <payload>".
+//
+// The discovery helper watches exactly one phone, so every line it prints
+// carries the MAC of that phone. When the target changes the helper has to be
+// rebound, but the old process can still deliver a few lines before it is
+// gone — and those lines belong to the *previous* phone. They must never
+// touch the shared presence state: they would keep the laptop unlocked or
+// prevent the auto-lock.
+//
+// Returns the uppercase MAC, or null when the line carries no usable tag.
+function helperLineMac(line) {
+    if (!line) return null
+    var trimmed = String(line).trim()
+    if (!trimmed) return null
+    var cut = trimmed.indexOf(" ")
+    if (cut <= 0) return null
+    var mac = trimmed.substring(0, cut).toUpperCase()
+    if (mac.indexOf(":") < 0) return null
+    return mac
+}
+
+// Parse one line of the helper's stdout for a given target.
+//
+// Returns null when the line must be ignored:
+//   - untagged lines (an older helper build, or a malformed line)
+//   - lines that belong to another device (the previous phone)
+//
+// Otherwise returns { kind, value, text }:
+//   kind  "ready" | "rssi" | "rssi-cache" | "device" | "error"
+//   value the numeric payload for "rssi"/"rssi-cache", otherwise null
+//   text  the payload as text
+function parseHelperLine(line, targetMac) {
+    var mac = helperLineMac(line)
+    if (!mac) return null
+    if (!targetMac) return null
+    if (mac !== String(targetMac).trim().toUpperCase()) return null
+    var payload = String(line).trim().substring(mac.length).trim()
+    if (!payload) return null
+    if (payload === "ready") return { kind: "ready", value: null, text: "ready" }
+    if (payload.indexOf("rssi-cache ") === 0) {
+        var cached = parseInt(payload.substring(11).trim(), 10)
+        if (isNaN(cached)) return null
+        return { kind: "rssi-cache", value: cached, text: payload }
+    }
+    if (payload.indexOf("rssi ") === 0) {
+        var n = parseInt(payload.substring(5).trim(), 10)
+        if (isNaN(n)) return null
+        return { kind: "rssi", value: n, text: payload }
+    }
+    if (payload.indexOf("device ") === 0) {
+        return { kind: "device", value: null, text: payload.substring(7).trim() }
+    }
+    if (payload.indexOf("error ") === 0) {
+        return { kind: "error", value: null, text: payload.substring(6).trim() }
+    }
+    return null
+}
+
 // Render RSSI for the popup. Returns "—" when the value is missing.
 function formatRssi(rssi) {
     if (rssi === null || rssi === undefined || rssi === 0) return "—"
@@ -344,6 +402,8 @@ function stateLabel(state) {
 if (typeof module !== "undefined" && module.exports) {
     module.exports = {
         parseBusctlRssi: parseBusctlRssi,
+        helperLineMac: helperLineMac,
+        parseHelperLine: parseHelperLine,
         formatRssi: formatRssi,
         signalBars: signalBars,
         isRssiFresh: isRssiFresh,
